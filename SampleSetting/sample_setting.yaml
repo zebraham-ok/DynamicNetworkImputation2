@@ -1,0 +1,59 @@
+# SampleSetting multi-config sampling training — config file
+# =========================================
+# Phase 1: first mode trained from scratch → save static_encoder as the shared backbone
+# Phase 2: remaining modes load the backbone and freeze it, training only temporal_encoder + edge_predictor
+
+# ---- Basic settings ----
+defaults:
+  config: gatgru_vec             # default model config name
+  device: auto                   # auto / cuda / cpu
+  backbone_donor: 0              # mode index of the backbone donor (0-based)
+  seed: 42                       # global random seed
+  resume: null                   # resume: path to an existing output directory (skips completed modes)
+                                 #   e.g.: results/gatgru/sampling_<timestamp>
+                                 #   command-line --resume overrides this value
+
+# ---- Negative-sampling modes ----
+# 4 modes = the 2x2 combination of filter_factset_neg × intra_industry_neg
+# use_pred_neg is uniformly fixed to true
+sampling_modes:
+  - name: ftt
+    desc: "filter_factset=false, intra_industry=true (most conservative)"
+    filter_factset_neg: false
+    intra_industry_neg: true
+    use_pred_neg: true
+
+  - name: ftf
+    desc: "filter_factset=true, intra_industry=true"
+    filter_factset_neg: true
+    intra_industry_neg: true
+    use_pred_neg: true
+
+  - name: fff
+    desc: "filter_factset=false, intra_industry=false (least conservative)"
+    filter_factset_neg: false
+    intra_industry_neg: false
+    use_pred_neg: true
+
+  - name: tff
+    desc: "filter_factset=true, intra_industry=false"
+    filter_factset_neg: true
+    intra_industry_neg: false
+    use_pred_neg: true
+
+# ---- Model parameter overrides (optional) ----
+# The command-line --num_rnn_layers overrides the value here.
+# Note: enabling num_rnn_layers=2 yields the GAT-GRU* in Appendix A.3 tab:ablation
+# (two BiGRU layers), not the 1-layer GAT-GRU in the main table tab:results; keep it commented when reproducing the main results.
+model_overrides:
+  # num_rnn_layers: 2         # enabling this reproduces GAT-GRU* (two BiGRU layers)
+  # static_hidden_dim: 192
+  # dynamic_hidden_dim: 96
+  # dropout: 0.4
+  # heads: 6
+
+# ---- Output settings ----
+output:
+  root: results                   # results root directory, relative to the repo root
+  subdir: gatgru                  # model subdirectory
+  prefix: sampling                # output directory prefix → sampling_{timestamp}[_rnnN]

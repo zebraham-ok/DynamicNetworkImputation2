@@ -1,0 +1,36 @@
+# ============================================================
+# BiGRU-Vectorized (Node-GRU vectorized version) model-specific config
+# Used merged with Bootstraps/common_config.yaml or Training/common_config.yaml
+# ============================================================
+
+name: BiGRU-Vec
+output_subdir: bigru_vec
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.nodegru_vectorized
+  class: BiGRUImputationVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gcn_layers: 2
+    num_rnn_layers: 2
+    dropout: 0.3
+    time_steps: auto
+    device: auto
+    use_fc_embedding: true
+    fc_embed_dim: 128
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

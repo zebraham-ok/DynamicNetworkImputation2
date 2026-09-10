@@ -1,0 +1,44 @@
+# ============================================================
+# Shared configuration for all models (common_config.yaml)
+# Each model can override same-named parameters in Bootstraps/configs/xxx.yaml
+# ============================================================
+
+# --- Data ---
+dataset:
+  train_ratio: 0.8                  # training set ratio
+  negative_ratio: 1                 # negative-to-positive sample ratio
+  min_degree: 2                     # node min-degree filter
+  source_filter: semi               # data source filter (semi: semiconductor supply chain only)
+  other_possible_fill: 0.0          # experimental fill parameter (0.0=original, 0.5=experimental)
+
+  # Negative sampling control
+  filter_factset_neg: false         # whether dynamic negative sampling avoids factset edges (True=avoid, False=allow)
+  intra_industry_neg: true          # whether to use intra-industry negative sampling
+  use_pred_neg: true                # whether to use predefined negative samples
+
+# --- Debug ---
+toy_mode: false                     # enable toy mode (quick validation on a small amount of data)
+
+# --- Trainer ---
+trainer:
+  num_epochs: 60                    # number of training epochs
+  patience: 10                      # early-stopping patience
+  max_factset_edges: 5000           # factset sampling cap (null=all)
+  kwargs:
+    use_tensorboard: true
+    margin_lambda: 0.1              # BCE + MarginRankingLoss weight
+
+# --- Pretrained model loading ---
+# If a pretrained model path is provided, its feature extractor (static_encoder/static_gnn)
+# is loaded and frozen, while the remaining modules (temporal_encoder/edge_predictor) are retrained
+pretrained:
+  path: null                        # pretrained model path (null=train from scratch)
+
+# --- Test-set prediction saving (for ROC/AUC curve plotting) ---
+# After training, run one full inference pass over the test set with the best model,
+# saving prediction scores and labels as .npy
+save_test_predictions: true        # whether to save test-set predictions (.npy)
+
+# --- Analysis ---
+analysis:
+  batch_size: 128                   # batch size for analysis

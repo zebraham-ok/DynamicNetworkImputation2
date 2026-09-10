@@ -1,0 +1,33 @@
+# ============================================================
+# BiTNA-Vectorized (TNA vectorized version) model-specific config
+# Used merged with Bootstraps/common_config.yaml or Training/common_config.yaml
+# ============================================================
+
+name: BiTNA-Vec
+output_subdir: tna_vec
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.grutna_vectorized
+  class: BiTNAImputationVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    dropout: 0.3
+    time_steps: auto
+    device: auto
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+  patience: 5
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

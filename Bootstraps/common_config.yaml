@@ -1,0 +1,33 @@
+# ============================================================
+# Bootstrap shared config (common_config.yaml)
+# Deep-merged with Models/configs/{model}.yaml: common is the base, model overrides
+# ============================================================
+
+# --- Data ---
+dataset:
+  train_ratio: 0.8                  # Training set ratio
+  negative_ratio: 1                 # Negative sample ratio
+  min_degree: 2                     # Node minimum degree filter
+  source_filter: semi               # Data source filter (semi: semiconductor supply chain only)
+  other_possible_fill: 0.0          # Experimental fill parameter (0.0=original, 0.5=experimental)
+
+  # Negative sampling controls
+  filter_factset_neg: false         # Whether dynamic negative sampling avoids factset edges (True=avoid, False=allow)
+  intra_industry_neg: true          # Whether to use intra-industry negative sampling
+  use_pred_neg: true                # Whether to use predefined negative samples
+
+# --- Debug ---
+toy_mode: false                     # Enable toy mode (uses a small amount of data for quick validation)
+
+# --- Trainer ---
+trainer:
+  num_epochs: 60                    # Training epochs
+  patience: 10                      # Early-stopping patience
+  max_factset_edges: null           # factset sampling cap (null=all, toy_mode suggests 5000)
+  kwargs:
+    use_tensorboard: true
+    margin_lambda: 0.1              # BCE + MarginRankingLoss weight
+
+# --- Analysis ---
+analysis:
+  batch_size: 128                   # Batch size during analysis

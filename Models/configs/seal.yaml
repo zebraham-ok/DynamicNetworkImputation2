@@ -1,0 +1,46 @@
+# ============================================================
+# Temp-SEAL model-specific config
+# Used merged with Bootstraps/common_config.yaml or Training/common_config.yaml
+# ============================================================
+
+name: Temp-SEAL
+output_subdir: seal
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 32
+
+model:
+  module: Models.tempseal
+  class: SEALWithTemporalWeighting
+  kwargs:
+    num_features: auto
+    hidden_dim: 128
+    k_hop: 2
+    batch_size: 32
+    gcn_dropout: 0.3
+    edge_dropout: 0.1
+    device: auto
+
+trainer:
+  type: standard
+  module: Training.train_dualseal
+  class: SEALTrainer
+  num_epochs: 2           # train for only 2 epochs, relying on step-level evaluation
+  kwargs:
+    use_tensorboard: true
+    lr: 0.001
+    weight_decay: 0.0001
+    grad_clip_norm: 1.0
+    val_ratio: 0.1
+    patience: 15
+    lr_patience: 8
+    lr_factor: 0.5
+    periodic_eval_records: 32000  # evaluate once every 32000 records (equivalent to every 1000 steps at batch_size=32)
+
+analysis:
+  predict_interface: data_node_time
+  checkpoint_metrics: [test_precision, test_recall]
+  batch_size: 32
