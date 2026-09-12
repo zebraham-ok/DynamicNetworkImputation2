@@ -1,0 +1,42 @@
+# ============================================================
+# Dependencies
+#   pip install -r requirements.txt
+#
+# The PyG extension wheels (torch-scatter / torch-sparse) have no
+# portable default build: they must match your torch and CUDA
+# versions. For example, with torch 2.1.0 + CUDA 12.1:
+#   pip install torch-scatter torch-sparse \
+#       -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+# ============================================================
+
+# --- deep learning ---
+torch>=1.11.0
+torch-geometric>=2.0.0
+torch-scatter
+torch-sparse
+
+# --- scientific computing ---
+numpy>=1.20.0
+scipy>=1.7.0
+pandas>=1.3.0
+
+# --- machine learning ---
+scikit-learn>=1.0.0
+
+# --- graph analysis ---
+networkx>=2.6.0
+
+# --- database ---
+neo4j>=5.0.0
+
+# --- configuration & environment ---
+pyyaml>=6.0
+python-dotenv>=0.19.0
+
+# --- visualisation ---
+matplotlib>=3.4.0
+seaborn>=0.11.0
+tensorboard>=2.8.0
+
+# --- progress bars ---
+tqdm>=4.62.0

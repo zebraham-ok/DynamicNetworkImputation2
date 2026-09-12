@@ -1,0 +1,40 @@
+# ============================================================
+# GAT-GRU-1Dir (GAT-GRU unidirectional-temporal ablation version) model-specific config
+# Purpose: bidirectional ablation (bidirectional vs. unidirectional GRU); versus gatgru_vec.yaml
+#       the only difference = model.module/class point to the unidirectional version, all other hyper-params identical.
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+
+name: GAT-GRU-1Dir
+output_subdir: gatgru_1dire
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.gatgru_1dire
+  class: UniGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
+    # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

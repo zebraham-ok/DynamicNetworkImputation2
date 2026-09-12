@@ -1,0 +1,76 @@
+# ============================================================
+# Bootstrap v2 unified configuration file
+# Train:   python Bootstraps/bootstrap_v2_train.py -c Bootstraps/bootstrap_v2_config.yaml
+# Analyze: python Bootstraps/bootstrap_v2_analysis.py --dir results/bootstrap/xxx/
+#
+# CLI arguments can override any field in this file, e.g.:
+#   -c bootstrap_v2_config.yaml --training.device cuda:1 --training.epochs 100
+# ============================================================
+
+# === Model definition (from Models/configs/) ===
+model:
+  config: gatgru_vec                      # Model config name, maps to Models/configs/{name}.yaml
+
+# === Pretrained weights (leave empty or set to null to enable training from scratch) ===
+pretrained:
+  # path: results/gatgru/<run>/best_model.pth   # Pretrained model path
+  path: null                           # null=from scratch: round 1 trains all parameters, backbone auto-extracted for reuse
+
+# === Data parameters ===
+data:
+  embedding_name: embedding               # Embedding name
+  test_ratio: 0.10                        # Test set ratio
+  val_ratio: 0.10                         # Validation set ratio
+  negative_ratio: 1                       # Dynamic negatives per positive (1x);
+  min_degree: 2                           # Node minimum degree filter
+  source_filter: semi                     # Data source filter (semi: semiconductor supply chain only)
+  other_possible_fill: 0.0                # Experimental fill parameter (0.0=original)
+  filter_factset_neg: false               # Whether dynamic negative sampling avoids factset edges
+  intra_industry_neg: true                # Intra-industry negative sampling
+
+  # CSV predefined negatives (stopped_neg_sample.csv). When true they are injected before the split
+  # and distributed 8:1:1 among the negatives (0.8 train pool / 0.1 val / 0.1 test), using the same
+  # stratified procedure as the positives; when false the file is not imported at all.
+  use_pred_neg: true
+  neg_dir: null                           # CSV path override (null = Data/stopped_neg_sample.csv)
+
+  # === Node feature construction ===
+  # true -> X = [embedding | one-hot(country) | one-hot(industry_2nd) | one-hot(category_3rd)]
+  # Vocabulary is built from the data at load time; attribute names must match the Neo4j schema.
+  use_attr_onehot: true
+  onehot_attrs:
+    - country
+    - industry_2nd
+    - category_3rd
+
+# === Bootstrap iterations ===
+bootstrap:
+  num_iterations: 5                       # Number of Bootstrap iterations B
+  seed_base: 0                      # Random seed base (iteration b uses seed=seed_base+b)
+
+# === Training parameters ===
+training:
+  device: auto                            # Device (auto/cuda/cuda:0/cuda:1/cpu)
+  epochs: 10                              # Training epochs per Bootstrap iteration
+  patience: 5                             # Early-stopping patience (epochs tolerated without val_auc improvement)
+  batch_size: 128                         # Batch size
+  lr: 0.001                               # Learning rate
+  weight_decay: 0.00001                   # Adam weight decay
+
+# === Loss function ===
+loss:
+  margin_lambda: 0.1                      # BCE + λ·MarginRankingLoss
+  margin: 1.0                             # MarginRankingLoss margin
+
+# === Output ===
+output:
+  subdir: null                            # Output subdirectory name (null=auto timestamp, or specify manually e.g. "my_experiment")
+
+# === Analysis parameters ===
+analysis:
+  batch_size: 128                         # Batch size at inference time
+  device: auto                            # Device used for analysis
+
+# === Debug ===
+debug:
+  toy_mode: false                         # Enable toy mode for quick validation (uses a small amount of data)

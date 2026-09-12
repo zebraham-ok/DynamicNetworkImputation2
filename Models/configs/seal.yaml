@@ -1,0 +1,58 @@
+# ============================================================
+# Temp-SEAL model-specific config
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+
+name: Temp-SEAL
+output_subdir: seal
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 32
+
+model:
+  module: Models.tempseal
+  class: SEALWithTemporalWeighting
+  kwargs:
+    num_features: auto
+    hidden_dim: 128
+    k_hop: 2
+    batch_size: 32
+    gcn_dropout: 0.3
+    edge_dropout: 0.1
+    device: auto
+    # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
+    # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
+
+trainer:
+  type: standard
+  module: Training.train_dualseal
+  class: SEALTrainer
+  num_epochs: 2           # train for only 2 epochs, relying on step-level evaluation
+  kwargs:
+    use_tensorboard: true
+    lr: 0.001
+    weight_decay: 0.0001
+    grad_clip_norm: 1.0
+    # Fallback only: the validation split passed in from create_dataloaders takes precedence, and
+    # this random_split of the training pool is used only when that split is unavailable.
+    val_ratio: 0.1
+    # Consumed only by SEALTrainer (Training/train_dualseal.py). The shared DynamicGraphTrainer,
+    # which SampleSetting/run_sampling.py always instantiates, reads the TOP-LEVEL trainer.patience
+    # from Training/common_config.yaml instead; this key therefore neither overrides nor is
+    # overridden by it (different key path).
+    patience: 15
+    # LR schedule (ReduceLROnPlateau on the step-level selection metric). lr_patience counts
+    # EVALUATIONS (one every periodic_eval_records records), not epochs, and a reduction needs
+    # strictly more evaluations than lr_patience. With num_epochs=2 a whole run holds only ~8
+    # evaluations, so 8 can never trigger; lower it (e.g. 3) or raise num_epochs.
+    lr_patience: 8
+    lr_factor: 0.5
+    periodic_eval_records: 32000  # evaluate once every 32000 records (equivalent to every 1000 steps at batch_size=32)
+
+analysis:
+  predict_interface: data_node_time
+  checkpoint_metrics: [test_precision, test_recall]
+  batch_size: 32

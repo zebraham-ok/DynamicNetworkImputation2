@@ -1,0 +1,48 @@
+# ============================================================
+# Imputation prediction common config (imputation_common.yaml)
+# Merged with Models/configs/{model}.yaml
+# ============================================================
+
+# --- Data ---
+data:
+  label_name: EntityObj               # Neo4j node label
+  embedding_name: embedding            # embedding property name
+  relation_name: SupplyProductTo       # edge relation type
+  rel_condition: "{source: 'semi'}"    # relation filter condition (semi filter when building the graph)
+  year_range: [2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  source_filter: semi                  # data source filter
+
+# --- Prediction ---
+prediction:
+  threshold: 0.452                     # prediction probability threshold, above this value is saved to Neo4j
+  batch_size: 512                      # batch size for batched inference
+  test_mode: false                     # test mode: true=process only one industry
+  test_industry: "example_industry"  # must match a key in indus_network.json; used only in test mode
+  skip_existing: false                  # whether to skip edges that already exist in Neo4j
+
+# --- Industry network ---
+indus_network:
+  path: info/indus_network.json        # industry upstream/downstream dependency file path (relative to project root)
+
+# --- Model ---
+model:
+  checkpoint: ""                       # model checkpoint path (if empty, auto-search results/ for best_model.pth)
+  device: auto                         # device (auto/cuda/cpu)
+
+# --- Embedding precomputation ---
+embedding_cache:
+  enabled: true                        # whether to enable the dynamic embedding precompute cache (recommended; large speedup)
+  save_path: ""                        # precomputed embedding save path (if empty, saved to results/{model}/imputation_embeddings.pt)
+  force_recompute: false               # whether to force recomputation (ignore cached embeddings)
+
+# --- Neo4j output ---
+output:
+  source: imputation                   # source property value of the imputed edge
+  model_name: ""                       # model property value of the imputed edge (if empty, uses the model config name)
+  relation_name: SupplyProductTo       # output edge relation type
+
+# --- Performance tuning (used only by get_imputation_fast.py) ---
+performance:
+  num_writers: 1                       # number of background writer threads (1 recommended to avoid Neo4j deadlock; UNWIND batch writes are efficient enough)
+  flush_size: 500                      # number of edges accumulated before a batch write to Neo4j (UNWIND batch insert)
+  query_threads: 8                     # number of Neo4j query threads (used to preload company info and search existing edges)

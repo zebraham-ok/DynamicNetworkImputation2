@@ -1,0 +1,72 @@
+# ============================================================
+# Shared configuration for all models (common_config.yaml)
+# Each model can override same-named parameters in Models/configs/{model}.yaml
+# (deep merge, per key: Training/config_loader.load_config; model-specific keys win)
+# ============================================================
+
+# --- Data ---
+dataset:
+  train_ratio: 0.8                  # training set ratio
+  negative_ratio: 1                 # negative-to-positive sample ratio
+  min_degree: 2                     # node min-degree filter
+  source_filter: semi               # data source filter (semi: semiconductor supply chain only)
+  other_possible_fill: 0.0          # experimental fill parameter (0.0=original, 0.5=experimental)
+
+  # Negative sampling control
+  filter_factset_neg: false         # whether dynamic negative sampling avoids factset edges (True=avoid, False=allow)
+  intra_industry_neg: true          # whether to use intra-industry negative sampling
+  use_pred_neg: true                # whether to use predefined negative samples
+
+  # --- Node feature construction (single switch for the whole pipeline) ---
+  # When true, one-hot blocks of the categorical attributes below are concatenated to the
+  # dense text embedding, i.e. X = [embedding | one-hot(country) | one-hot(industry_2nd) | ...].
+  # Combined with the shared feature extractor (model.kwargs.use_fc_embedding) this turns the
+  # projection into a real dimensionality reduction instead of a 128 -> 128 re-encoder.
+  # Attribute names must match the Neo4j schema of the graph being read (anonymised releases
+  # may use different property names). The vocabulary is derived from the data at load time.
+  use_attr_onehot: true
+  onehot_attrs:
+    - country
+    - industry_2nd
+    - category_3rd
+
+# --- Model architecture: the parts shared by every backbone ---
+# Inherited by every Models/configs/{model}.yaml through the deep merge, so the shared node-feature
+# extractor has exactly ONE editable location. A model that needs a different extractor re-declares
+# the same key in its own YAML and wins (same-key merge: model file overrides common).
+# The values below equal the NodeFeatureExtractor defaults in Models/common.py
+# (fc_hidden_dim: null -> fc_embed_dim * 2), so even a consumer that reads a model YAML without
+# merging this file builds the identical module.
+model:
+  kwargs:
+    use_fc_embedding: true          # enable the shared node-feature extractor
+    fc_embed_dim: 128               # output width handed to each model's spatial encoder
+    fc_hidden_dim: 256              # hidden width of the extractor MLP (= fc_embed_dim * 2)
+    fc_num_layers: 3                # number of linear layers in the extractor MLP
+
+# --- Debug ---
+toy_mode: false                     # enable toy mode (quick validation on a small amount of data)
+
+# --- Trainer ---
+trainer:
+  num_epochs: 60                    # number of training epochs
+  patience: 10                      # early-stopping patience
+  max_factset_edges: 5000           # factset sampling cap (null=all)
+  kwargs:
+    use_tensorboard: true
+    margin_lambda: 0.1              # BCE + MarginRankingLoss weight
+
+# --- Pretrained model loading ---
+# If a pretrained model path is provided, its feature extractor (static_encoder/static_gnn)
+# is loaded and frozen, while the remaining modules (temporal_encoder/edge_predictor) are retrained
+pretrained:
+  path: null                        # pretrained model path (null=train from scratch)
+
+# --- Test-set prediction saving (for ROC/AUC curve plotting) ---
+# After training, run one full inference pass over the test set with the best model,
+# saving prediction scores and labels as .npy
+save_test_predictions: true        # whether to save test-set predictions (.npy)
+
+# --- Analysis ---
+analysis:
+  batch_size: 128                   # batch size for analysis
