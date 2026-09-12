@@ -49,9 +49,15 @@ model:
 toy_mode: false                     # enable toy mode (quick validation on a small amount of data)
 
 # --- Trainer ---
+# Model configs should NOT cap this per model: num_epochs is only a ceiling that guarantees the run
+# terminates, while the effective stopping rule is the early-stopping budget below.
+# EARLY STOPPING HAS EXACTLY ONE KNOB: trainer.selection.patience (below), read by both
+# DynamicGraphTrainer and SEALTrainer. The former top-level trainer.patience was removed on
+# 2026-09-12: nothing reads it any more, and a config that still sets it gets a warning from
+# Training/config_loader.py. If selection.patience is left empty, the trainers fall back to their
+# built-in default (EARLY_STOP_PATIENCE_DEFAULT = 10 in Training/trainer_common.py) and warn.
 trainer:
-  num_epochs: 60                    # number of training epochs
-  patience: 10                      # early-stopping patience (fallback: see selection.patience)
+  num_epochs: 60                    # epoch ceiling (runs normally stop earlier via early stopping)
   max_factset_edges: 5000           # factset sampling cap (null=all)
 
   # --- Model selection + early stopping: ONE unified criterion (see Training/trainer_common.py) ---
@@ -64,7 +70,8 @@ trainer:
     use_factset: false              # false = select on the ranking metric only (FSQ still logged)
     metric: auc                     # auc | f1, computed on the selection split (val when available)
     ema_span: 5                     # exponential-moving-average span; <=1 disables the smoothing
-    patience: 15                    # early-stopping budget (epochs); null -> trainer.patience
+    patience: 15                    # early-stopping budget (epochs); THE ONLY patience knob
+                                    # empty -> built-in default 10 (with a warning)
                                     # keep it > lr_schedule.plateau_patience
 
   # --- Learning-rate schedule (dynamic graph trainer only; SEALTrainer has its own) ---
@@ -84,6 +91,14 @@ trainer:
   kwargs:
     use_tensorboard: true
     margin_lambda: 0.1              # BCE + MarginRankingLoss weight
+    # MarginRankingLoss margin = the required gap between a positive and a negative score
+    # (max(0, margin - (p_pos - p_neg))). READ BEFORE CHANGING: every model head ends with a
+    # Sigmoid, so the scores live in [0, 1] and the largest achievable gap is exactly 1.0.
+    # A margin >= 1.0 can therefore only be met at full saturation (p_pos = 1, p_neg = 0): the
+    # hinge never switches off and keeps pushing every pair towards the two corners, which
+    # flattens/widens the score tails and costs calibration (Brier, threshold stability).
+    # Values such as 0.25 keep it a genuine ranking constraint; 1.0 = historical behaviour.
+    margin: 0.5
 
 # --- Pretrained model loading ---
 # If a pretrained model path is provided, its feature extractor (static_encoder/static_gnn)
@@ -92,9 +107,11 @@ pretrained:
   path: null                        # pretrained model path (null=train from scratch)
 
 # --- Test-set prediction saving (for ROC/AUC curve plotting) ---
-# After training, run one full inference pass over the test set with the best model,
-# saving prediction scores and labels as .npy
-save_test_predictions: true        # whether to save test-set predictions (.npy)
+# Whenever a best model is (re)written during training, run one full inference pass over the test set
+# with that model and save its prediction scores as .npy, together with the Youden's J / F1-max
+# thresholds those very scores imply (see TechnicalGuide.md §5.3). False skips both the .npy and the
+# threshold records; it changes no training number (nothing here feeds selection or early stopping).
+save_test_predictions: true        # true (default) | false
 
 # --- Analysis ---
 analysis:

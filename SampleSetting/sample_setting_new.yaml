@@ -9,7 +9,7 @@ defaults:
   device: auto                   # auto / cuda / cpu
   backbone_donor: 0              # mode index of the backbone donor (0-based)
   seed: 42                       # global random seed of the first repeat
-  repeats: 1                     # number of repeated runs (seed ensemble); repeat k uses seed+k.
+  repeats: 4                     # number of repeated runs (seed ensemble); repeat k uses seed+k.
                                  #   1 = single run, historical layout (output written directly into
                                  #   results/<subdir>/sampling_<timestamp>/, no seed* level).
                                  #   N > 1 = each repeat gets results/.../sampling_<timestamp>/seed<seed>/
@@ -36,11 +36,11 @@ defaults:
 # split and distributes them 8:1:1 over the negatives (0.8 train pool / 0.1 val / 0.1 test). The
 # val/test fixed negatives are used in every mode; only the CSV share depends on this switch.
 sampling_modes:
-  - name: ftt
-    desc: "filter_factset=false, intra_industry=true, use_pred_neg=true (CSV negatives ON)"
-    filter_factset_neg: false
-    intra_industry_neg: true
-    use_pred_neg: true
+  # - name: ftt
+  #   desc: "filter_factset=false, intra_industry=true, use_pred_neg=true (CSV negatives ON)"
+  #   filter_factset_neg: false
+  #   intra_industry_neg: true
+  #   use_pred_neg: true
 
   - name: ftf
     desc: "filter_factset=false, intra_industry=true, use_pred_neg=false (CSV negatives OFF)"
@@ -54,11 +54,11 @@ sampling_modes:
     intra_industry_neg: false
     use_pred_neg: false
 
-  - name: fft
-    desc: "filter_factset=false, intra_industry=false, use_pred_neg=true"
-    filter_factset_neg: false
-    intra_industry_neg: false
-    use_pred_neg: true
+  # - name: fft
+  #   desc: "filter_factset=false, intra_industry=false, use_pred_neg=true"
+  #   filter_factset_neg: false
+  #   intra_industry_neg: false
+  #   use_pred_neg: true
 
 # ---- Model parameter overrides (optional) ----
 # The command-line --num_rnn_layers overrides the value here.

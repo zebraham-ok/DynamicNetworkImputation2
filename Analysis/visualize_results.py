@@ -245,7 +245,46 @@ def extract_scalars(event_dir, include_wall_time=False):
     return result
 
 
-def compute_epoch_duration_from_walltime(scalars_wt, model=''):
+def read_recorded_epochs(run_dir):
+    """Number of epochs a run actually trained, as recorded by the run itself.
+
+    SEAL writes `run_summary.json` (`epochs`); `run_sampling.py` writes `summary.yaml`
+    (`results.<mode>.epochs_run` per mode, `_meta.epochs_run` for the aggregate).
+    Returns None when neither file is present / readable (e.g. a restructured run directory).
+    """
+    import json
+    run_dir = Path(run_dir)
+
+    json_path = run_dir / 'run_summary.json'
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding='utf-8'))
+            value = data.get('epochs')
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+        except Exception:
+            pass
+
+    yaml_path = run_dir / 'summary.yaml'
+    if yaml_path.exists():
+        try:
+            data = yaml.safe_load(yaml_path.read_text(encoding='utf-8')) or {}
+            candidates = []
+            for entry in (data.get('results') or {}).values():
+                if isinstance(entry, dict) and entry.get('epochs_run') is not None:
+                    candidates.append(entry['epochs_run'])
+            if (data.get('_meta') or {}).get('epochs_run') is not None:
+                candidates.append(data['_meta']['epochs_run'])
+            candidates = [int(c) for c in candidates if isinstance(c, (int, float)) and c > 0]
+            if candidates:
+                return max(candidates)
+        except Exception:
+            pass
+
+    return None
+
+
+def compute_epoch_duration_from_walltime(scalars_wt, model='', num_epochs=None):
     """
     Estimate per-epoch duration from event wall_time (wall_time difference between
     consecutive epoch summary events); returns the mean epoch duration (seconds).
@@ -254,7 +293,11 @@ def compute_epoch_duration_from_walltime(scalars_wt, model=''):
 
     Special handling for the SEAL model: its Epoch_* metrics are recorded per
     periodic_eval_steps (default 1000) rather than per epoch and must be rescaled
-    by the total number of steps.
+    by the total number of steps. `num_epochs` is the epoch count recorded by the run
+    (see read_recorded_epochs, run_summary.json / summary.yaml); without it no rescaling is
+    possible and the raw inter-event gap is returned, because the batch-to-epoch ratio cannot be
+    inferred from the scalars (SEAL logs nothing at epoch granularity except Time/Epoch_Duration,
+    and this fallback only runs when that tag is missing).
     """
     candidate_tags = ['Train/Epoch_BCE', 'Test/Epoch_AUC', 'Test/Epoch_F1',
                       'Train/Epoch_F1', 'Test/Epoch_Loss']
@@ -282,15 +325,19 @@ def compute_epoch_duration_from_walltime(scalars_wt, model=''):
 
     avg_dt = float(np.mean(durations))
 
-    # SEAL special handling: Train/Epoch_* is recorded per batch step and must be rescaled to epoch duration
+    # SEAL special handling: Train/Epoch_* is recorded per batch step and must be rescaled to epoch
+    # duration. The epoch count is NOT hard-coded any more: SEAL trains until early stopping (the
+    # epoch ceiling comes from Training/common_config.yaml, not from Models/configs/seal.yaml), so
+    # it is read from the run's own record.
     if model == 'seal':
+        if not num_epochs or num_epochs < 1:
+            return avg_dt
         max_step = selected_tag[-1][0]
         step_gap = selected_tag[1][0] - selected_tag[0][0]
         if step_gap <= 0:
             return avg_dt
 
-        default_num_epochs = 2
-        batches_per_epoch = max_step / default_num_epochs
+        batches_per_epoch = max_step / num_epochs
 
         epoch_time = avg_dt * (batches_per_epoch / step_gap)
 
@@ -338,7 +385,10 @@ def collect_all_data():
 
             # Estimate from wall_time and inject only when TensorBoard itself did not record this tag
             if 'Time/Epoch_Duration' not in scalars_wt:
-                avg_dur = compute_epoch_duration_from_walltime(scalars_wt, model=model)
+                # SEAL needs the number of epochs the run actually trained (it is no longer fixed),
+                # which only the run's own summary knows.
+                avg_dur = compute_epoch_duration_from_walltime(
+                    scalars_wt, model=model, num_epochs=read_recorded_epochs(run_dir))
             else:
                 avg_dur = None
             if avg_dur is not None:

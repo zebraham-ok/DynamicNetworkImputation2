@@ -4,7 +4,8 @@
 #
 # EvolveGCN-H's evolved operator W_t is injected between the GAT attention and the BiGRU:
 #     s_t = GAT_t(z);  W_t = MatGRU(W_{t-1}, mean_N(z));
-#     u_t = act(s_t @ W_t + A_t . (s_t @ W_t));  then BiGRU -> pair head ([B, 4*64+1] = 257).
+#     u_t = s_t + g * (s_t @ W_t + A_t . (s_t @ W_t));  g zero-init (residual_injection: true);
+#     then BiGRU -> pair head ([B, 4*64+1] = 257).
 # Design doc: results/FUSION_DESIGN_OPTIONS_0912.md section 7.  Implementation: Models/fusion_temporal_injection.py
 #
 # Run (the YAML output.subdir only covers the default backbone, so -s is REQUIRED here):
@@ -41,6 +42,18 @@ model:
     detach_global: true
     # Second aggregation A_t . (s_t @ W_t) on top of the self-connection; false => plain s_t @ W_t.
     use_adjacency: true
+    # true  -> u_t = s_t + g * (A_t (s_t W_t) + s_t W_t), per-channel gate g zero-init, linear
+    #          correction.  u_t == s_t at init, so the encoder starts life as plain GAT-GRU (the
+    #          FiLM zero-init analogue, required by the "not worse than the backbone at init"
+    #          contract).  The correction stays linear on purpose: at this feature scale
+    #          (x std ~0.087) the projection is mean-zero at ~1e-4 and an EGCN-style ReLU leaves
+    #          97.4% of its entries at exactly 0, killing both the signal and g's gradient.
+    # false -> u_t = act(A_t (s_t W_t) + s_t W_t): the original non-residual form.  Measured on the
+    #          real graph this feeds the BiGRU a 31x smaller, 97.4%-zero, identically-zero-after-
+    #          2014 sequence and the model collapses to a near-constant output at epoch 1
+    #          (val AUC 0.4723, Precision 0.5000, Recall 1.0000, val Loss 1.53 > ln 2).
+    #          Kept only for comparison / ablation.
+    residual_injection: true
     # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
     # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
     # NOTE: static_hidden_dim must equal the extractor output width (fc_embed_dim), because W_t

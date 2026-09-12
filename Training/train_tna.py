@@ -13,7 +13,7 @@ import inspect
 import numpy as np
 from datetime import datetime
 from Training.config_loader import load_config
-from Training.trainer_common import DynamicGraphTrainer
+from Training.trainer_common import DynamicGraphTrainer, EARLY_STOP_PATIENCE_DEFAULT
 from utils import import_attr, resolve_auto_kwargs
 
 
@@ -93,6 +93,9 @@ if __name__ == "__main__":
         use_tensorboard=trainer_cfg.get('kwargs', {}).get('use_tensorboard', True),
         log_dir=os.path.join(save_dir, run_name),
         margin_lambda=trainer_cfg.get('kwargs', {}).get('margin_lambda', 0.1),
+        # Ranking-loss margin, config key trainer.kwargs.margin (default 1.0 = old behaviour);
+        # keep it < 1.0 because the Sigmoid head caps the achievable score gap at 1.0.
+        margin=trainer_cfg.get('kwargs', {}).get('margin', 1.0),
         factset_edges=factset_edges,
         node_mapping=node_mapping,
         reverse_node_mapping=reverse_node_mapping,
@@ -101,12 +104,17 @@ if __name__ == "__main__":
         # as SampleSetting/run_sampling.py, so their numbers stay comparable.
         selection_cfg=trainer_cfg.get('selection'),
         lr_schedule_cfg=trainer_cfg.get('lr_schedule'),
+        # Reporting switch (top-level config key): False skips the test-prediction .npy dump and the
+        # threshold records that go with it. Default True, same as SampleSetting/run_sampling.py.
+        save_test_predictions=cfg.get('save_test_predictions', True),
     )
 
     train_kwargs = {
         'num_epochs': trainer_cfg.get('num_epochs', 50),
         'save_path': os.path.join(save_dir, run_name, 'best_model.pth'),
-        'patience': trainer_cfg.get('patience', 10),
+        # Fallback only: the early-stopping budget is trainer.selection.patience (resolved inside
+        # train()); the deprecated trainer.patience is no longer read.
+        'patience': EARLY_STOP_PATIENCE_DEFAULT,
     }
     if trainer_cfg.get('max_factset_edges') is not None:
         train_kwargs['max_factset_edges'] = trainer_cfg['max_factset_edges']

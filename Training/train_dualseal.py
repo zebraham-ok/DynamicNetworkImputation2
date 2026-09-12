@@ -23,6 +23,8 @@ import numpy as np
 from tqdm import tqdm
 from Models.tempseal import SEALWithTemporalWeighting
 from torch.utils.tensorboard import SummaryWriter
+from utils import youden_f1max_thresholds
+from Training.trainer_common import EARLY_STOP_PATIENCE_DEFAULT
 
 
 class SEALTrainer:
@@ -31,14 +33,18 @@ class SEALTrainer:
                  device='cuda' if torch.cuda.is_available() else 'cpu', log_dir='runs/seal_experiment',
                  use_tensorboard=True,
                  lr=0.001, weight_decay=1e-4, grad_clip_norm=1.0,
-                 val_ratio=0.1, patience=15, lr_patience=8, lr_factor=0.5,
+                 val_ratio=0.1, patience=EARLY_STOP_PATIENCE_DEFAULT, lr_patience=8, lr_factor=0.5,
                  factset_edges=None, node_mapping=None, reverse_node_mapping=None,
                  max_factset_edges=None,
                  periodic_eval_steps=1000,
-                 periodic_eval_records=None):
+                 periodic_eval_records=None, save_test_predictions=True):
         self.model = model.to(device)
         self.static_data = static_data.to(device)
         self.device = device
+        # Test-set prediction dump (.npy + the threshold record that goes with it). On by default:
+        # it is a reporting artefact that changes no training number. Top-level config key
+        # `save_test_predictions` of Training/common_config.yaml.
+        self.save_test_predictions = bool(save_test_predictions)
 
         # Factset external validation
         self.factset_edges = factset_edges if factset_edges else []
@@ -519,8 +525,26 @@ class SEALTrainer:
         }
         return select_metrics, test_metrics
 
-    def save_test_predictions_npy(self, npy_path, checkpoint_path=None):
-        """Run inference on the test set and save prediction scores as .npy (dict: 'test_predictions'/'neg_predictions'), for ROC/AUC curve plotting."""
+    def save_test_predictions_npy(self, npy_path, checkpoint_path=None, epoch=None, tag=''):
+        """
+        Run inference on the test set and save prediction scores as .npy (dict:
+        'test_predictions'/'neg_predictions'), for ROC/AUC curve plotting.
+
+        The thresholds implied by those very scores (Youden's J and F1-max of the test set) are
+        printed and recorded next to the .npy as well, see `_record_test_thresholds`. They document
+        the operating point of the saved file only: neither value feeds selection or early stopping
+        (both use the selection split).
+
+        epoch: 0-based epoch index of the checkpoint that produced these scores (recorded 1-based).
+        tag:   short label of the caller ('best' / 'best_auc') to tell the two .npy apart.
+
+        Honours `self.save_test_predictions` (config key `save_test_predictions`, default true): when
+        it is false this is a no-op, so neither the .npy nor the threshold record is written. The
+        guard lives here rather than at the call sites so that every caller honours the switch.
+        """
+        if not self.save_test_predictions:
+            return
+
         import numpy as np
 
         if checkpoint_path is not None:
@@ -562,28 +586,93 @@ class SEALTrainer:
         np.save(npy_path, save_dict)
         print(f"[SavePred] test-set predictions saved: {npy_path}")
         print(f"  positives: {len(pos_scores)}, negatives: {len(neg_scores)}")
-        if len(pos_scores) > 0 and len(neg_scores) > 0:
-            from sklearn.metrics import roc_auc_score
-            y_true = np.concatenate([np.ones(len(pos_scores)), np.zeros(len(neg_scores))])
-            y_scores = np.concatenate([pos_scores, neg_scores])
-            try:
-                auc = roc_auc_score(y_true, y_scores)
-                print(f"  AUC: {auc:.4f}")
-            except:
-                pass
 
-    def train(self, num_epochs=2, save_path='best_model.pth'):
+        thresholds = youden_f1max_thresholds(pos_scores, neg_scores)
+        if thresholds is None:
+            print("  thresholds: skipped (one class is empty, metrics undefined)")
+            return
+        print(f"  AUC: {thresholds['auc']:.4f}")
+        print(f"  Youden's J threshold: {thresholds['youden_j']:.4f} "
+              f"(J={thresholds['youden_j_stat']:.4f}, TPR={thresholds['tpr_at_youden']:.4f}, "
+              f"FPR={thresholds['fpr_at_youden']:.4f}, F1={thresholds['f1_at_youden']:.4f})")
+        print(f"  F1-max threshold:     {thresholds['f1_max']:.4f} "
+              f"(F1={thresholds['f1_at_f1max']:.4f})")
+        if thresholds['youden_j_at_inf']:
+            print("  NOTE: the test scores are constant, so Youden's J sits at +inf "
+                  "(recorded as youden_j=1.0 with youden_j_at_inf=true)")
+        self._record_test_thresholds(npy_path, thresholds, epoch=epoch, tag=tag)
+
+    def _record_test_thresholds(self, npy_path, thresholds, epoch=None, tag=''):
+        """
+        Persist the threshold report computed from a saved .npy:
+          - `<npy stem>_thresholds.json` : the latest report for that file (overwritten);
+          - `thresholds_history.jsonl`   : one appended line per save, so the drift of the operating
+                                           point across the epochs of a single run stays auditable.
+
+        Bookkeeping only; failures are reported and never interrupt training.
+        """
+        import json
+        record = {
+            'recorded_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'npy': os.path.basename(npy_path),
+            'tag': tag or None,
+            # 1-based, same numbering as the "Saved best model (Step ...)" line right above
+            'epoch': None if epoch is None else int(epoch) + 1,
+            'source': 'test-set scores stored in this .npy (not the selection split)',
+        }
+        record.update(thresholds)
+        out_dir = os.path.dirname(npy_path) or '.'
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            json_path = os.path.splitext(npy_path)[0] + '_thresholds.json'
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
+            with open(os.path.join(out_dir, 'thresholds_history.jsonl'), 'a',
+                      encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            print(f"  thresholds recorded: {os.path.basename(json_path)}"
+                  f" + thresholds_history.jsonl")
+        except Exception as e:
+            print(f"  WARNING: failed to record the thresholds: {e}")
+
+    def train(self, num_epochs=None, save_path='best_model.pth', patience=None):
+        """Step-level training loop.
+
+        num_epochs: hard ceiling on the number of epochs (None = uncapped). The model config no
+            longer sets it (see Models/configs/seal.yaml), so it is inherited from
+            Training/common_config.yaml (trainer.num_epochs) and only guarantees the run terminates.
+        patience: early-stopping budget in EPOCHS without a new best selection score, where the
+            selection score is the same step-level selection-split F1 that drives the checkpoint.
+            Resolution matches DynamicGraphTrainer: the single knob is trainer.selection.patience
+            (Training/common_config.yaml). None -> fall back to the value given to __init__
+            (EARLY_STOP_PATIENCE_DEFAULT); 0 disables early stopping (num_epochs then required).
+        """
+        max_epochs = int(num_epochs) if num_epochs else None
+        self.patience = int(patience) if patience is not None else int(self.patience or 0)
+        if max_epochs is None and self.patience <= 0:
+            raise ValueError("SEALTrainer.train: pass either num_epochs (ceiling) or patience "
+                             "(early stopping); both are unset.")
+
         print("SEAL Step-Level Training")
         print(f"Device: {self.device}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
         if self.val_loader:
             print(f"Validation samples: {len(self.val_loader.dataset)}")
         print(f"Test samples: {len(self.test_loader.dataset)}")
+        print(f"Save test predictions: {'on' if self.save_test_predictions else 'off'} "
+              f"(config key `save_test_predictions`)")
         if self._periodic_eval_mode == 'records':
-            print(f"Epochs: {num_epochs} | Periodic Eval every: ~{self._periodic_eval_records} records "
+            print(f"Periodic Eval every: ~{self._periodic_eval_records} records "
                   f"(≈{self.periodic_eval_steps} steps @ batch_size={self.train_loader.batch_size})")
         else:
-            print(f"Epochs: {num_epochs} | Periodic Eval every: {self.periodic_eval_steps} steps")
+            print(f"Periodic Eval every: {self.periodic_eval_steps} steps")
+        # The epoch budget is a ceiling only: what actually stops the run is the early-stopping
+        # counter below (same key path as the shared DynamicGraphTrainer).
+        print(f"Epochs: {max_epochs if max_epochs is not None else 'uncapped'} "
+              f"(ceiling = trainer.num_epochs)")
+        print(f"Early stopping: patience={self.patience if self.patience > 0 else 'off'} epochs "
+              f"without a new best {self.selection_split} F1 "
+              f"(trainer.selection.patience)")
         print(f"Hyperparameters: lr={self.optimizer.param_groups[0]['lr']}, "
               f"weight_decay={self.optimizer.param_groups[0]['weight_decay']}, "
               f"grad_clip={self.grad_clip_norm}")
@@ -591,20 +680,27 @@ class SEALTrainer:
               f"factor={self.lr_factor}, patience={self.lr_patience} evaluations, min_lr=1e-6)")
         # Guard: the schedule counts evaluations, so report up-front when it cannot trigger at all
         # instead of leaving lr_patience a silent no-op.
-        total_evals = (max(len(self.train_loader), 1) * num_epochs) // self.periodic_eval_steps
-        if total_evals <= self.lr_patience:
-            print(f"  [warn] LR schedule will NOT trigger in this run: ~{total_evals} periodic "
-                  f"evaluations <= lr_patience={self.lr_patience} "
-                  f"(lower lr_patience or raise num_epochs)")
+        if max_epochs is not None:
+            total_evals = (max(len(self.train_loader), 1) * max_epochs) // self.periodic_eval_steps
+            if total_evals <= self.lr_patience:
+                print(f"  [warn] LR schedule will NOT trigger in this run: ~{total_evals} periodic "
+                      f"evaluations <= lr_patience={self.lr_patience} "
+                      f"(lower lr_patience or raise num_epochs)")
 
         best_f1 = 0
         best_step = 0
         best_auc = 0.0
+        patience_counter = 0        # consecutive epochs without a new best selection F1
+        self.early_stop_counter = 0
+        self.early_stopped = False
+        epochs_run = 0
 
         try:
-            for epoch in range(num_epochs):
+            epoch = 0
+            while max_epochs is None or epoch < max_epochs:
+                improved_this_epoch = False
                 epoch_start_time = time.time()
-                print(f"\nEpoch {epoch+1}/{num_epochs}")
+                print(f"\nEpoch {epoch+1}/{max_epochs if max_epochs is not None else '?'}")
                 self.model.train()
 
                 pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}')
@@ -676,6 +772,9 @@ class SEALTrainer:
                         if select_f1 > best_f1:
                             best_f1 = select_f1
                             best_step = self.global_train_step
+                            # Same quantity drives the checkpoint and the early-stopping counter
+                            # (mirrors the ONE-criterion rule of DynamicGraphTrainer).
+                            improved_this_epoch = True
                             os.makedirs(os.path.dirname(save_path), exist_ok=True)
                             torch.save(self._checkpoint_dict(epoch, select_metrics, test_metrics),
                                        save_path)
@@ -685,7 +784,8 @@ class SEALTrainer:
                                   f'Test AUC={test_metrics["auc"]:.4f})')
                             # Also save test-set predictions (overwrite, consistent with best_model.pth)
                             best_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best.npy')
-                            self.save_test_predictions_npy(best_npy_path, checkpoint_path=None)
+                            self.save_test_predictions_npy(best_npy_path, checkpoint_path=None,
+                                                           epoch=epoch, tag='best')
                             self.model.train()
 
                         if select_auc > best_auc:
@@ -697,7 +797,8 @@ class SEALTrainer:
                                   f'{self.selection_split} AUC={select_auc:.4f})')
                             # Also save test-set predictions (overwrite, consistent with best_auc_model.pth)
                             best_auc_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best_auc.npy')
-                            self.save_test_predictions_npy(best_auc_npy_path, checkpoint_path=None)
+                            self.save_test_predictions_npy(best_auc_npy_path, checkpoint_path=None,
+                                                           epoch=epoch, tag='best_auc')
                             self.model.train()
 
                 # Epoch summary
@@ -713,6 +814,23 @@ class SEALTrainer:
                     print(f'Epoch {epoch+1} - BCE: {avg_bce:.4f}, '
                           f'F1: {ep_f1:.4f}, AUC: {ep_auc:.4f} '
                           f'({epoch_duration:.1f}s)')
+
+                # --- Early stopping: counted in EPOCHS without a new best selection F1 ---
+                # The counter reacts to the very quantity that selected the checkpoint (and to
+                # nothing else), so checkpoint and stopping rule cannot disagree.
+                epochs_run = epoch + 1
+                if improved_this_epoch:
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                self.early_stop_counter = patience_counter
+                if self.patience > 0 and patience_counter >= self.patience:
+                    self.early_stopped = True
+                    print(f"Early stopping triggered! Stopping after epoch {epoch+1} "
+                          f"(no new best {self.selection_split} F1 for {self.patience} epochs; "
+                          f"budget = trainer.selection.patience)")
+                    break
+                epoch += 1
 
             # Training finished, load the best model
             print(f"\nLoading best model (Step {best_step}, "
@@ -736,7 +854,13 @@ class SEALTrainer:
                 'test_loss', 'test_f1', 'test_auc',
                 'factset_quantile', 'wasserstein_pos', 'wasserstein_neg', 'wasserstein_diff',
                 'factset_quantile_test', 'wasserstein_diff_test')}
-            summary['epochs'] = num_epochs
+            # `epochs` = epochs actually run (may stop well before the ceiling);
+            # `epochs_planned` keeps the ceiling that was in force, `patience` / `early_stopped`
+            # document why the run ended.
+            summary['epochs'] = epochs_run
+            summary['epochs_planned'] = max_epochs
+            summary['patience'] = self.patience
+            summary['early_stopped'] = self.early_stopped
             summary['best_auc'] = best_auc
             summary['final_lr'] = self.optimizer.param_groups[0]['lr']
             summary['scheduler_evals'] = self.scheduler_evals
@@ -754,6 +878,10 @@ class SEALTrainer:
 
         print(f"\nTraining complete! Best Step: {best_step}, "
               f"{self.selection_split} F1: {best_f1:.4f}")
+        print(f"Epochs run: {epochs_run}"
+              + (f" (early stopped after {self.patience} epochs without improvement)"
+                 if self.early_stopped else
+                 f" (ceiling {max_epochs})" if max_epochs is not None else " (uncapped)"))
         if self.epoch_durations:
             print(f"Average epoch time: {float(np.mean(self.epoch_durations)):.1f}s "
                   f"over {len(self.epoch_durations)} epochs")
@@ -845,7 +973,10 @@ if __name__ == "__main__":
         grad_clip_norm=trainer_kw.get('grad_clip_norm', 1.0),
         # val_ratio only applies when no external val_loader is supplied
         val_ratio=trainer_kw.get('val_ratio', 0.1),
-        patience=trainer_kw.get('patience', 15),
+        # Early stopping is NOT taken from the model config any more; it is resolved below from
+        # trainer.selection.patience (Training/common_config.yaml), the single knob shared with
+        # DynamicGraphTrainer. The constructor default (EARLY_STOP_PATIENCE_DEFAULT) stays as the
+        # last-resort fallback of train(patience=None).
         lr_patience=trainer_kw.get('lr_patience', 8),
         lr_factor=trainer_kw.get('lr_factor', 0.5),
         factset_edges=factset_edges,
@@ -854,10 +985,25 @@ if __name__ == "__main__":
         max_factset_edges=trainer_cfg.get('max_factset_edges'),
         periodic_eval_steps=trainer_kw.get('periodic_eval_steps', 1000),
         periodic_eval_records=trainer_kw.get('periodic_eval_records', None),
+        # Reporting switch (top-level config key): False skips the .npy dump + threshold records
+        save_test_predictions=cfg.get('save_test_predictions', True),
     )
 
+    # Epoch budget and early stopping are NOT model-specific (Models/configs/seal.yaml no longer
+    # overrides them):
+    #   * num_epochs  -> trainer.num_epochs of Training/common_config.yaml (a ceiling only);
+    #   * patience    -> trainer.selection.patience, the single early-stopping knob and exactly the
+    #                    same key path DynamicGraphTrainer.train() resolves.
+    selection_cfg = trainer_cfg.get('selection') or {}
+    num_epochs = trainer_cfg.get('num_epochs')
+    patience = selection_cfg.get('patience')
+    print(f"Epoch budget: num_epochs={num_epochs} (ceiling) | early stopping: "
+          f"patience={patience if patience is not None else EARLY_STOP_PATIENCE_DEFAULT} "
+          f"epochs without improvement (trainer.selection.patience)")
+
     trainer.train(
-        num_epochs=trainer_cfg.get('num_epochs', 2),
+        num_epochs=num_epochs,
         save_path=os.path.join(save_dir, run_name, 'best_model.pth'),
+        patience=patience,
     )
 

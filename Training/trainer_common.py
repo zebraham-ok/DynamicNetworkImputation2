@@ -27,6 +27,8 @@ Usage:
                                       #            'patience': 15}  (trainer.selection in the YAML config)
         lr_schedule_cfg=...,          # optional: {'enabled': True, 'name': 'cosine', 'base_lr': 5e-4, ...}
                                       #            (trainer.lr_schedule in the YAML config)
+        save_test_predictions=True,   # False -> no test-prediction .npy dump and no threshold
+                                      #          records (config key `save_test_predictions`)
     )
 """
 
@@ -48,6 +50,8 @@ from torch.utils.tensorboard import SummaryWriter
 import warnings
 warnings.filterwarnings('ignore')
 
+from utils import youden_f1max_thresholds
+
 
 # --- Selection protocol defaults -------------------------------------------------------------
 # The historical protocol (0.5 * FactSet quantile + 0.5 * selection-split AUC, no smoothing) is
@@ -57,8 +61,15 @@ DEFAULT_SELECTION_CFG = {
     'use_factset': True,   # False -> the FactSet quantile is monitored but NOT used in selection
     'metric': 'auc',       # 'auc' | 'f1', computed on the selection split (val when available)
     'ema_span': 1,         # exponential-moving-average span; <=1 disables the smoothing
-    'patience': None,      # early-stopping budget; None -> use the patience argument of train()
+    'patience': None,      # early-stopping budget; None -> EARLY_STOP_PATIENCE_DEFAULT (below)
 }
+
+# Early stopping has exactly ONE knob: trainer.selection.patience (Training/common_config.yaml).
+# The former top-level trainer.patience is no longer read by anything (2026-09-12,
+# Training/config_loader.py warns when it is still present). This constant is only the last-resort
+# fallback for callers that pass no selection block at all; a selection block that omits patience
+# triggers a warning in DynamicGraphTrainer.__init__.
+EARLY_STOP_PATIENCE_DEFAULT = 10
 
 # --- Learning-rate schedule defaults ---------------------------------------------------------
 # Disabled by default: a constant learning rate equal to base_lr (the historical behaviour).
@@ -102,13 +113,24 @@ class DynamicGraphTrainer:
                  log_dir=None, use_tensorboard=True,
                  margin_lambda=0.1, margin=1.0, factset_edges=None,
                  node_mapping=None, reverse_node_mapping=None,
-                 static_data=None, selection_cfg=None, lr_schedule_cfg=None):
+                 static_data=None, selection_cfg=None, lr_schedule_cfg=None,
+                 save_test_predictions=True):
         # Selection criterion / early-stopping budget and the learning-rate schedule are resolved
         # first: both the optimizer and train() depend on them.
         self.selection_cfg = dict(DEFAULT_SELECTION_CFG)
         self.selection_cfg.update(selection_cfg or {})
+        # Single early-stopping knob: a selection block that omits patience would otherwise fall back
+        # to EARLY_STOP_PATIENCE_DEFAULT invisibly (the old top-level trainer.patience is ignored).
+        if selection_cfg and not self.selection_cfg.get('patience'):
+            print(f"  [warn] trainer.selection.patience is not set: early stopping uses the built-in "
+                  f"default of {EARLY_STOP_PATIENCE_DEFAULT} epochs instead "
+                  f"(the deprecated trainer.patience is no longer read).")
         self.lr_schedule_cfg = dict(DEFAULT_LR_SCHEDULE_CFG)
         self.lr_schedule_cfg.update(lr_schedule_cfg or {})
+        # Test-set prediction dump (.npy + the threshold record that goes with it). On by default:
+        # it is a reporting artefact that changes no training number. Top-level config key
+        # `save_test_predictions` of Training/common_config.yaml; entry points pass it through.
+        self.save_test_predictions = bool(save_test_predictions)
 
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -141,7 +163,14 @@ class DynamicGraphTrainer:
         self._ema_state = {}         # per-metric EMA state, reset implicitly at every run
 
         self.bce_criterion = nn.BCELoss()
-        self.margin_loss = nn.MarginRankingLoss(margin=margin)
+        # Ranking loss. Config key trainer.kwargs.margin (entry points pass it through). Note that
+        # every model head ends with a Sigmoid, so the scores live in [0, 1] and the largest
+        # achievable gap p_pos - p_neg is exactly 1.0: a margin >= 1.0 is reachable only at full
+        # saturation (p_pos = 1, p_neg = 0), i.e. the hinge never switches off and keeps pushing
+        # every pair towards the two corners. Keep it < 1.0 when calibration / threshold
+        # stability matters; 1.0 is the historical behaviour.
+        self.margin = float(margin)
+        self.margin_loss = nn.MarginRankingLoss(margin=self.margin)
         self.margin_lambda = margin_lambda
 
         # Factset external validation
@@ -667,12 +696,28 @@ class DynamicGraphTrainer:
 
         return avg_loss, precision, recall, f1, auc
 
-    def save_test_predictions_npy(self, npy_path, checkpoint_path=None):
+    def save_test_predictions_npy(self, npy_path, checkpoint_path=None, epoch=None, tag=''):
         """
         Run inference on the test set and save prediction scores as .npy (dict:
         'test_predictions'/'neg_predictions', each a list of positive/negative sample scores),
         for ROC/AUC curve plotting.
+
+        The thresholds implied by those very scores (Youden's J and F1-max of the test set) are
+        printed and recorded next to the .npy as well, see `_record_test_thresholds`. They document
+        the operating point of the saved file only: neither value feeds selection or early stopping
+        (both use the selection split, see `train`).
+
+        epoch: 0-based epoch index of the checkpoint that produced these scores (recorded 1-based,
+               matching the "Saved best model (epoch N)" line printed just above).
+        tag:   short label of the caller ('best' / 'best_auc') to tell the two .npy apart.
+
+        Honours `self.save_test_predictions` (config key `save_test_predictions`, default true): when
+        it is false this is a no-op, so neither the .npy nor the threshold record is written. The
+        guard lives here rather than at the call sites so that every caller honours the switch.
         """
+        if not self.save_test_predictions:
+            return
+
         import numpy as np
 
         if checkpoint_path is not None:
@@ -715,21 +760,62 @@ class DynamicGraphTrainer:
         np.save(npy_path, save_dict)
         print(f"[SavePred] test-set predictions saved: {npy_path}")
         print(f"  positives: {len(pos_scores)}, negatives: {len(neg_scores)}")
-        if len(pos_scores) > 0 and len(neg_scores) > 0:
-            from sklearn.metrics import roc_auc_score
-            y_true = np.concatenate([np.ones(len(pos_scores)), np.zeros(len(neg_scores))])
-            y_scores = np.concatenate([pos_scores, neg_scores])
-            try:
-                auc = roc_auc_score(y_true, y_scores)
-                print(f"  AUC: {auc:.4f}")
-            except:
-                pass
 
-    def train(self, num_epochs, save_path='best_dynamic_graph_model.pth', patience=10,
-              max_factset_edges=None):
+        thresholds = youden_f1max_thresholds(pos_scores, neg_scores)
+        if thresholds is None:
+            print("  thresholds: skipped (one class is empty, metrics undefined)")
+            return
+        print(f"  AUC: {thresholds['auc']:.4f}")
+        print(f"  Youden's J threshold: {thresholds['youden_j']:.4f} "
+              f"(J={thresholds['youden_j_stat']:.4f}, TPR={thresholds['tpr_at_youden']:.4f}, "
+              f"FPR={thresholds['fpr_at_youden']:.4f}, F1={thresholds['f1_at_youden']:.4f})")
+        print(f"  F1-max threshold:     {thresholds['f1_max']:.4f} "
+              f"(F1={thresholds['f1_at_f1max']:.4f})")
+        if thresholds['youden_j_at_inf']:
+            print("  NOTE: the test scores are constant, so Youden's J sits at +inf "
+                  "(recorded as youden_j=1.0 with youden_j_at_inf=true)")
+        self._record_test_thresholds(npy_path, thresholds, epoch=epoch, tag=tag)
+
+    def _record_test_thresholds(self, npy_path, thresholds, epoch=None, tag=''):
+        """
+        Persist the threshold report computed from a saved .npy:
+          - `<npy stem>_thresholds.json` : the latest report for that file (overwritten);
+          - `thresholds_history.jsonl`   : one appended line per save, so the drift of the operating
+                                           point across the epochs of a single run stays auditable.
+
+        Bookkeeping only; failures are reported and never interrupt training.
+        """
+        import json
+        record = {
+            'recorded_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'npy': os.path.basename(npy_path),
+            'tag': tag or None,
+            # 1-based, same numbering as the "Saved best model (epoch N)" line right above
+            'epoch': None if epoch is None else int(epoch) + 1,
+            'source': 'test-set scores stored in this .npy (not the selection split)',
+        }
+        record.update(thresholds)
+        out_dir = os.path.dirname(npy_path) or '.'
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            json_path = os.path.splitext(npy_path)[0] + '_thresholds.json'
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
+            with open(os.path.join(out_dir, 'thresholds_history.jsonl'), 'a',
+                      encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            print(f"  thresholds recorded: {os.path.basename(json_path)}"
+                  f" + thresholds_history.jsonl")
+        except Exception as e:
+            print(f"  WARNING: failed to record the thresholds: {e}")
+
+    def train(self, num_epochs, save_path='best_dynamic_graph_model.pth',
+              patience=EARLY_STOP_PATIENCE_DEFAULT, max_factset_edges=None):
         # ONE unified criterion drives the checkpoint AND the early-stopping counter, so the two can
         # no longer disagree (the historical implementation selected on the composite score but
         # counted patience on the selection-split AUC, sharing a single counter).
+        # trainer.selection.patience is the only early-stopping knob; the `patience` argument is a
+        # last-resort fallback for callers that pass no selection block at all.
         patience = int(self.selection_cfg.get('patience') or patience)
         best_score = 0.0
         best_epoch = 0
@@ -745,11 +831,14 @@ class DynamicGraphTrainer:
         if max_factset_edges and factset_display > max_factset_edges:
             factset_display = max_factset_edges
         print(f"Factset edges: {len(self.factset_edges)} (actually used: {factset_display})")
-        print(f"Margin Lambda: {self.margin_lambda}")
+        print(f"Margin Lambda: {self.margin_lambda}, Margin: {self.margin:g} "
+              f"(the score gap the ranking loss demands; scores are in [0, 1])")
         print(f"Selection criterion: {self.selection_criterion} "
               f"({self.selection_split} split, early stopping patience={patience})")
         print(f"Learning rate: base={self.base_lr:g}, schedule={self._lr_schedule_label()}, "
               f"weight_decay={self.weight_decay:g}")
+        print(f"Save test predictions: {'on' if self.save_test_predictions else 'off'} "
+              f"(config key `save_test_predictions`)")
         if self.lr_scheduler is not None and patience <= self._plateau_patience():
             print(f"WARNING: early-stopping patience ({patience}) <= plateau patience "
                   f"({self._plateau_patience()}): the learning rate will be reduced only after the "
@@ -868,13 +957,19 @@ class DynamicGraphTrainer:
                         'selection_metric': self.selection_cfg.get('metric', 'auc'),
                         'selection_use_factset': bool(self.selection_cfg.get('use_factset', True)),
                         'selection_ema_span': float(self.selection_cfg.get('ema_span', 1) or 1),
+                        # Loss weights of the BCE + margin_lambda * MarginRankingLoss objective:
+                        # a run trained with a different margin is not comparable with the rest,
+                        # so the effective values travel with the checkpoint.
+                        'margin_lambda': self.margin_lambda,
+                        'margin': self.margin,
                     }
                     save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(save_dict, save_path)
                     print(f"Saved best model (epoch {epoch+1}), {self.selection_criterion} = "
                           f"{current_score:.4f} ({self.selection_split} split)")
                     best_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best.npy')
-                    self.save_test_predictions_npy(best_npy_path, checkpoint_path=None)
+                    self.save_test_predictions_npy(best_npy_path, checkpoint_path=None,
+                                                   epoch=epoch, tag='best')
 
                 # Side product: the epoch with the highest raw AUC of the selection split. It never
                 # drives the early-stopping counter (that is the unified criterion's job).
@@ -899,13 +994,17 @@ class DynamicGraphTrainer:
                         'selection_criterion': self.selection_criterion,
                         'selection_score': current_score,
                         'selection_score_raw': selection['score_raw'],
+                        # Loss weights, kept in step with the best-model checkpoint above.
+                        'margin_lambda': self.margin_lambda,
+                        'margin': self.margin,
                     }
                     auc_save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(auc_save_dict, auc_save_path)
                     print(f"Saved best-AUC model (epoch {epoch+1}), "
                           f"{self.selection_split} AUC: {select_auc:.4f}")
                     best_auc_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best_auc.npy')
-                    self.save_test_predictions_npy(best_auc_npy_path, checkpoint_path=None)
+                    self.save_test_predictions_npy(best_auc_npy_path, checkpoint_path=None,
+                                                   epoch=epoch, tag='best_auc')
 
                 if not improved:
                     patience_counter += 1

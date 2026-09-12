@@ -24,6 +24,17 @@ is applied once, so the same ``z`` feeds every year) are worth stating explicitl
 * ``detach_global`` (default ``True``) cuts the gradient of the driver branch, so the operator
   gradient cannot compete with the attention branch for the same representation (design doc
   section 7, risk "gradient coupling").
+* ``residual_injection`` (default ``True``) makes the injection **residual** with a
+  zero-initialised per-channel gate:  ``u_t = s_t + g * act(A_t (s_t W_t) + s_t W_t)`` with
+  ``g = 0`` at init, hence ``u_t == s_t`` **exactly** (in train and eval mode) and the encoder
+  starts life as plain GAT-GRU.  This is the exact analogue of option 4's zero-initialised FiLM
+  MLP (``gamma = beta = 0 => s' == s``) and enforces the same "a new architecture must not be
+  worse than the backbone at initialisation" contract.  The gradient w.r.t. ``g`` is non-zero at
+  init (``g=0`` does not zero the gate's gradient), so the injection can still creep in on its
+  own schedule.  Set ``residual_injection: false`` in the config to recover the original
+  non-residual form ``u_t = act(A_t (s_t W_t) + s_t W_t)``: that variant starts from a
+  near-constant output (all samples on the same side of the 0.5 boundary) and is kept only for
+  comparison.
 
 The operator evolution is **not** re-implemented: ``MatGRUCell_PyG`` and
 ``precompute_adj_matrices`` are imported from ``Models/egcn.py`` and ``Models/common_vectorized.py``
@@ -60,13 +71,20 @@ class TemporalInjectionEncoder(nn.Module):
     """
 
     def __init__(self, driver_dim, hidden_dim, dynamic_hidden_dim, num_rnn_layers=1,
-                 dropout=0.3, activation=None, detach_global=True, use_adjacency=True):
+                 dropout=0.3, activation=None, detach_global=True, use_adjacency=True,
+                 residual_injection=True):
         super().__init__()
         self.driver_dim = int(driver_dim)
         self.hidden_dim = int(hidden_dim)
         self.detach_global = bool(detach_global)
         self.use_adjacency = bool(use_adjacency)
+        self.residual_injection = bool(residual_injection)
         self.activation = activation if activation is not None else nn.ReLU()
+
+        if self.residual_injection:
+            # Per-channel injection gate, zero => u_t == s_t at init (encoder == plain GAT-GRU).
+            # Non-zero gradient at g=0, so training can open the gate on its own.
+            self.injection_gate = nn.Parameter(torch.zeros(self.hidden_dim))
 
         # EvolveGCN-H's operator evolution, reused verbatim (Models/egcn.py :: GRCU_PyG_Vectorized).
         self.evolve_weights = MatGRUCell_PyG(rows=self.driver_dim, cols=self.hidden_dim)
@@ -109,7 +127,18 @@ class TemporalInjectionEncoder(nn.Module):
             else:
                 out = transformed
 
-            injected.append(self.dropout(self.activation(out)).unsqueeze(0))
+            if self.residual_injection:
+                # u_t = s_t + g * (A_t (s_t W_t) + s_t W_t), with the per-channel gate g zero-init
+                # => u_t == s_t at init, so the encoder is bit-identical to GAT-GRU.  The correction
+                # is kept LINEAR (no `self.activation`): on the real graph the projected residual
+                # A_t (s_t W_t) + s_t W_t is mean-zero at ~1e-4 scale, so an EGCN-style ReLU would
+                # leave 97.4% of its entries at exactly 0 and kill both the injected signal and the
+                # gradient of g / W_t.  Non-linearity is provided downstream by the BiGRU.
+                # Dropout is applied to the correction only, so the identity path stays clean.
+                injected.append((static_sequence[t]
+                                 + self.injection_gate * self.dropout(out)).unsqueeze(0))
+            else:
+                injected.append(self.dropout(self.activation(out)).unsqueeze(0))
 
         injected = torch.cat(injected, dim=0)      # [T, N, hidden_dim]
         gru_input = injected.transpose(0, 1)       # [N, T, hidden_dim]
@@ -129,7 +158,8 @@ class TemporalInjectionGATGRU(nn.Module):
                  time_steps=list(range(2013, 2026)), device=None, heads=4,
                  use_checkpoint=True,
                  use_fc_embedding=True, fc_embed_dim=128, fc_hidden_dim=None, fc_num_layers=3,
-                 activation=None, detach_global=True, use_adjacency=True):
+                 activation=None, detach_global=True, use_adjacency=True,
+                 residual_injection=True):
         super().__init__()
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -195,6 +225,7 @@ class TemporalInjectionGATGRU(nn.Module):
             activation=activation,
             detach_global=detach_global,
             use_adjacency=use_adjacency,
+            residual_injection=residual_injection,
         )
 
         # Pair head: identical width to GAT-GRU's ([d_u, d_v, t] = 4 * hidden + 1)

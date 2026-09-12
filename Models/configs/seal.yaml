@@ -30,7 +30,11 @@ trainer:
   type: standard
   module: Training.train_dualseal
   class: SEALTrainer
-  num_epochs: 2           # train for only 2 epochs, relying on step-level evaluation
+  # NOTE: num_epochs is deliberately NOT set here. It is inherited from
+  # Training/common_config.yaml (trainer.num_epochs, currently 60) and acts as a safety ceiling
+  # only; the run normally stops earlier through early stopping, so Temp-SEAL is no longer capped
+  # at a few epochs (the historical `num_epochs: 2` left it severely under-trained and its metrics
+  # were not comparable with the other backbones).
   kwargs:
     use_tensorboard: true
     lr: 0.001
@@ -39,15 +43,16 @@ trainer:
     # Fallback only: the validation split passed in from create_dataloaders takes precedence, and
     # this random_split of the training pool is used only when that split is unavailable.
     val_ratio: 0.1
-    # Consumed only by SEALTrainer (Training/train_dualseal.py). The shared DynamicGraphTrainer,
-    # which SampleSetting/run_sampling.py always instantiates, reads the TOP-LEVEL trainer.patience
-    # from Training/common_config.yaml instead; this key therefore neither overrides nor is
-    # overridden by it (different key path).
-    patience: 15
+    # NOTE: patience is deliberately NOT set here either. Both trainers resolve the early-stopping
+    # budget from ONE key in Training/common_config.yaml: trainer.selection.patience (currently 15).
+    # The former top-level trainer.patience was removed on 2026-09-12 and is no longer read (when the
+    # key is left empty the built-in EARLY_STOP_PATIENCE_DEFAULT = 10 applies, with a warning).
+    # SEALTrainer counts it in EPOCHS without a new best step-level selection F1 (the same quantity
+    # that drives its checkpoint).
     # LR schedule (ReduceLROnPlateau on the step-level selection metric). lr_patience counts
     # EVALUATIONS (one every periodic_eval_records records), not epochs, and a reduction needs
-    # strictly more evaluations than lr_patience. With num_epochs=2 a whole run holds only ~8
-    # evaluations, so 8 can never trigger; lower it (e.g. 3) or raise num_epochs.
+    # strictly more evaluations than lr_patience. train() prints a warning when the epoch budget is
+    # too small for lr_patience to ever trigger.
     lr_patience: 8
     lr_factor: 0.5
     periodic_eval_records: 32000  # evaluate once every 32000 records (equivalent to every 1000 steps at batch_size=32)
