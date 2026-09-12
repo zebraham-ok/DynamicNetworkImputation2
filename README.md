@@ -98,11 +98,28 @@ scratch and the remaining modes reuse it frozen.
 python SampleSetting/run_sampling.py -c gatgru_vec
 python SampleSetting/run_sampling.py -c gatgru_vec --dry_run      # inspect only
 python SampleSetting/run_sampling.py -c bigru_vec                 # other backbones
+python SampleSetting/run_sampling.py -c gatgru_vec --repeats 5    # 5 seeds (42..46)
 ```
 
 Results land in `results/<model>/sampling_<timestamp>/<index>_<mode>_<scratch|frozen>/`,
 summarised in `summary.yaml`. Add `--resume` to skip already-finished modes, or
 `--num_rnn_layers 2` to reproduce the two-BiGRU-layer variant.
+
+`--repeats N` runs the whole protocol N times with seeds `seed, seed+1, ...` (the first
+seed comes from `--seed`, default 42). Each repeat re-initialises the model and writes its
+own `seed<SEED>/` subdirectory holding its own `backbone.pth`, checkpoints, TensorBoard
+events and `summary.yaml`, so differently initialised backbones can never be mixed up; the
+run root then carries a `summary.yaml` with the across-seed mean, standard deviation and
+95% confidence interval per metric. With the default `--repeats 1` the flat layout is
+unchanged.
+
+As soon as `--repeats > 1` the backbone donor rotates by default: the training order of the
+four modes is shifted by one every repeat, so the mode trained from scratch (and handing its
+backbone to the others) is a different one each time -- `ftt` in the first repeat, `ftf` in
+the second, and so on. That removes the systematic advantage of whichever mode happened to be
+picked as the donor. The run-root `summary.yaml` therefore reports the repeats twice: per mode
+key (`aggregate`, role included) and per mode (`by_mode`, 1 scratch + N-1 frozen runs pooled,
+with the two roles also kept apart). Use `--no_rotate_donor` to keep one fixed donor instead.
 
 ### 3.3 Bootstrap evaluation
 
@@ -136,7 +153,18 @@ python Analysis/visualize_results.py       # metric-vs-epoch figures
 python Analysis/plot_train_4metrics.py     # training figure used in the paper
 python Analysis/edge_imput_overlap_scan.py # threshold sweep vs. observed edges (queries Neo4j)
 python Analysis/edge_imput_overlap_plot.py # overlap-vs-threshold curve (reads the sweep JSON)
+python Analysis/seed_ci_summary.py         # across-seed mean ± 95% CI, from summary.yaml
 ```
+
+Seed ensembles (several runs of the same model and sampling flag) are aggregated on two
+levels: `Analysis/visualize_results.py --multi-run confidence` keeps every run and draws
+each curve as mean ± standard deviation, `--seed-ci` additionally writes the across-run
+best-epoch metrics with their 95% confidence intervals to `seed_ci_per_run.csv` /
+`seed_ci_summary.csv`; `Analysis/seed_ci_summary.py` produces the same summary directly
+from the per-seed `summary.yaml`, so it needs no TensorBoard event files. A run directory
+may carry the seed it used as a suffix (`0912-1118-fff-s3`). Whenever the repeats rotate
+their backbone donor, both scripts group by the sampling flag itself instead of by the
+`scratch`/`frozen` role, because every flag plays both roles across the repeats.
 
 `edge_imput_overlap_scan.py` writes `Analysis/edge_imput_overlap_scan_results.json`, which
 `edge_imput_overlap_plot.py` reads; it is the only analysis script that opens a database
@@ -210,6 +238,7 @@ figure script that needs a Temp-SEAL[fff] run to exist.
 │   ├── edge_imput_overlap_scan.py # Threshold sweep vs. observed edges -> JSON
 │   ├── edge_imput_overlap_plot.py # Overlap-vs-threshold curve (reads the sweep JSON)
 │   ├── PrROC2_fff.py              # GAT-GRU[fff] ROC curve reported in the paper
+│   ├── seed_ci_summary.py         # Across-seed mean ± 95% CI from per-seed summary.yaml
 │   └── edgebank_baseline_results.csv   # Input baseline table (not an output)
 ├── utils.py                       # Shared helpers (config merge, dynamic import)
 ├── requirements.txt
@@ -259,10 +288,11 @@ dataset:
 ```
 
 The vocabulary of each attribute is derived from the data at load time and sorted, so no
-vocabulary file has to be shipped; index 0 of every block is reserved for a missing /
-empty value, so nodes with an absent attribute are still distinguishable. Attribute names
-must match the Neo4j schema actually being read (anonymised releases rename some
-properties). When the switch is off, `X` is the 128-dimensional embedding alone.
+vocabulary file has to be shipped; each block is exactly as wide as the number of distinct
+non-empty values, and a node whose attribute is missing contributes an **all-zero row** for
+that block (no `<NA>` category is reserved). Attribute names must match the Neo4j schema
+actually being read (anonymised releases rename some properties). When the switch is off,
+`X` is the 128-dimensional embedding alone.
 
 All five backbones then feed `X` through **one shared extractor**
 (`Models/common.py → NodeFeatureExtractor`, built only via `build_feature_extractor`) whose
@@ -288,7 +318,7 @@ extractor than the one the checkpoint was trained with.
 GAT-GRU, GAT-GRU†, Node-GRU, TNA, EvolveGCN and Temp-SEAL all project `X` through this
 module before their own spatial encoder, so the comparison between backbones differs only
 in the encoder, not in the input representation. The projection is a genuine dimensionality
-reduction once `use_attr_onehot` is enabled (`128 + #age → 128`), whereas with the one-hot
+reduction once `use_attr_onehot` is enabled (`128 + attribute-columns → 128`), whereas with the one-hot
 off it is a 128 → 128 re-encoder. The extractor belongs to the frozen backbone: it is
 saved, reloaded and frozen together with `static_encoder` / `static_gnn` in the
 shared-backbone and bootstrap protocols.

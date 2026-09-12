@@ -2,10 +2,20 @@
 General-purpose trainer: supports BCE + Margin Ranking Loss (pairwise ranking loss),
 Factset quantile monitoring, and AUC.
 
-Model selection follows the standard protocol: the validation split drives checkpoint selection,
-the composite score (0.5 * FactSet quantile + 0.5 * validation AUC) and early stopping, while the
-test split is reported only. When no validation split is passed, the test split takes over that
-role, which reproduces the legacy behaviour.
+Model selection follows the standard protocol: the validation split drives checkpoint selection and
+early stopping, while the test split is reported only (when no validation split is passed, the test
+split takes over that role, reproducing the legacy behaviour).
+
+ONE unified criterion drives both the checkpoint and the early-stopping counter:
+
+    score = smooth(metric)                                     # selection.use_factset = false
+          = 0.5 * smooth(FactSet quantile) + 0.5 * smooth(metric)   # use_factset = true (legacy)
+
+`smooth` is an exponential moving average (selection.ema_span, <=1 disables it) and `metric` is the
+AUC (or F1) of the selection split. The FactSet quantile is always computed and logged, it only
+enters the criterion when selection.use_factset is true. The learning rate is constant unless
+lr_schedule.enabled is set (see DEFAULT_LR_SCHEDULE_CFG). Both blocks default to the historical
+behaviour, so entry points that pass nothing keep reproducing the old protocol.
 
 Usage:
     trainer = DynamicGraphTrainer(
@@ -13,6 +23,10 @@ Usage:
         factset_edges=factset_edges,  # optional: [(src, tgt, year), ...] for the factset quantile metric
         margin_lambda=0.1,            # Margin Ranking Loss weight
         static_data=static_data,      # only for backbones whose forward takes the static graph (Temp-SEAL)
+        selection_cfg=...,            # optional: {'use_factset': False, 'metric': 'auc', 'ema_span': 5,
+                                      #            'patience': 15}  (trainer.selection in the YAML config)
+        lr_schedule_cfg=...,          # optional: {'enabled': True, 'name': 'cosine', 'base_lr': 5e-4, ...}
+                                      #            (trainer.lr_schedule in the YAML config)
     )
 """
 
@@ -21,6 +35,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import inspect
+import math
 import time
 import torch
 import torch.nn as nn
@@ -32,6 +47,33 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# --- Selection protocol defaults -------------------------------------------------------------
+# The historical protocol (0.5 * FactSet quantile + 0.5 * selection-split AUC, no smoothing) is
+# kept as the default, so an entry point that passes no selection_cfg reproduces the old numbers
+# exactly. See Training/common_config.yaml -> trainer.selection for the documented switches.
+DEFAULT_SELECTION_CFG = {
+    'use_factset': True,   # False -> the FactSet quantile is monitored but NOT used in selection
+    'metric': 'auc',       # 'auc' | 'f1', computed on the selection split (val when available)
+    'ema_span': 1,         # exponential-moving-average span; <=1 disables the smoothing
+    'patience': None,      # early-stopping budget; None -> use the patience argument of train()
+}
+
+# --- Learning-rate schedule defaults ---------------------------------------------------------
+# Disabled by default: a constant learning rate equal to base_lr (the historical behaviour).
+DEFAULT_LR_SCHEDULE_CFG = {
+    'enabled': False,      # False -> constant base_lr (base_lr itself is still honoured)
+    'name': 'none',        # 'cosine' | 'step' | 'plateau' | 'none'
+    'base_lr': 0.001,
+    'min_lr': 0.0,
+    'warmup_epochs': 0,    # linear warmup (epochs) towards base_lr
+    'total_epochs': 0,     # cosine period (epochs); ignored by the other schedules
+    'milestones': [],      # step schedule: epochs at which the lr is multiplied by gamma
+    'gamma': 0.3,
+    'plateau_factor': 0.5,
+    'plateau_patience': 3,  # in EPOCHS (the ReduceLROnPlateau unit here), must be < early stopping
+}
 
 
 def _forward_takes_static_graph(model) -> bool:
@@ -60,7 +102,14 @@ class DynamicGraphTrainer:
                  log_dir=None, use_tensorboard=True,
                  margin_lambda=0.1, margin=1.0, factset_edges=None,
                  node_mapping=None, reverse_node_mapping=None,
-                 static_data=None):
+                 static_data=None, selection_cfg=None, lr_schedule_cfg=None):
+        # Selection criterion / early-stopping budget and the learning-rate schedule are resolved
+        # first: both the optimizer and train() depend on them.
+        self.selection_cfg = dict(DEFAULT_SELECTION_CFG)
+        self.selection_cfg.update(selection_cfg or {})
+        self.lr_schedule_cfg = dict(DEFAULT_LR_SCHEDULE_CFG)
+        self.lr_schedule_cfg.update(lr_schedule_cfg or {})
+
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -80,7 +129,17 @@ class DynamicGraphTrainer:
                 "create_dataloaders>."
             )
 
-        self.optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+        base_lr_cfg = self.lr_schedule_cfg.get('base_lr')
+        # Written explicitly instead of `or 0.001`: a deliberate base_lr of 0.0 (frozen weights, used
+        # by the offline tests) must not be silently replaced by the default.
+        self.base_lr = 0.001 if base_lr_cfg is None else float(base_lr_cfg)
+        self.optimizer = optim.Adam(model.parameters(), lr=self.base_lr, weight_decay=1e-5)
+        self.weight_decay = 1e-5
+        self.lr_scheduler = self._build_lr_scheduler()
+        self.lr_events = []          # [{'epoch', 'from', 'to'}, ...] every real lr reduction
+        self.selection_criterion = self._criterion_label()
+        self._ema_state = {}         # per-metric EMA state, reset implicitly at every run
+
         self.bce_criterion = nn.BCELoss()
         self.margin_loss = nn.MarginRankingLoss(margin=margin)
         self.margin_lambda = margin_lambda
@@ -113,6 +172,138 @@ class DynamicGraphTrainer:
         # re-deriving anything from the TensorBoard event files.
         self.history = []
         self.epoch_durations = []
+
+    # ------------------------------------------------------------------ selection criterion / lr
+    def _criterion_label(self) -> str:
+        """Human-readable name of the active selection criterion (printed and stored in the ckpt)."""
+        metric = str(self.selection_cfg.get('metric', 'auc') or 'auc').upper()
+        span = float(self.selection_cfg.get('ema_span', 1) or 1)
+        metric_label = metric if span <= 1 else f'EMA{int(span)}({metric})'
+        if not self.selection_cfg.get('use_factset', True):
+            return metric_label
+        fsq_label = 'FSQ' if span <= 1 else f'EMA{int(span)}(FSQ)'
+        return f'0.5*{fsq_label} + 0.5*{metric_label}'
+
+    def _smooth(self, key, value: float) -> float:
+        """Exponential moving average of one monitored quantity.
+
+        span <= 1 returns the raw value (no smoothing). The first value seeds the average directly
+        (no zero-bias correction needed, unlike Adam's bias correction).
+        """
+        span = float(self.selection_cfg.get('ema_span', 1) or 1)
+        if span <= 1:
+            self._ema_state[key] = value
+            return value
+        alpha = 2.0 / (span + 1.0)
+        previous = self._ema_state.get(key)
+        smoothed: float = value if previous is None else alpha * value + (1.0 - alpha) * previous
+        self._ema_state[key] = smoothed
+        return smoothed
+
+    def selection_score(self, select_auc, select_f1, factset_result):
+        """The single score that drives BOTH the checkpoint and the early-stopping counter.
+
+        Returns {'score', 'score_raw', 'ema_metric', 'ema_factset'}: `score` is the smoothed value
+        used for the comparison, `score_raw` the unsmoothed (legacy) value kept for the logs.
+        """
+        metric_name = str(self.selection_cfg.get('metric', 'auc') or 'auc').lower()
+        raw_metric = select_f1 if metric_name == 'f1' else select_auc
+        ema_metric = self._smooth('metric', raw_metric)
+
+        ema_factset = None
+        raw_score = raw_metric
+        if self.selection_cfg.get('use_factset', True) and factset_result is not None:
+            raw_score = 0.5 * factset_result['quantile'] + 0.5 * raw_metric
+            ema_factset = self._smooth('factset', factset_result['quantile'])
+
+        if ema_factset is None:
+            score = ema_metric
+        else:
+            score = 0.5 * ema_factset + 0.5 * ema_metric
+        return {'score': score, 'score_raw': raw_score,
+                'ema_metric': ema_metric, 'ema_factset': ema_factset}
+
+    # ---------------------------------------------------------------------- learning-rate schedule
+    def _plateau_patience(self) -> int:
+        return int(self.lr_schedule_cfg.get('plateau_patience', 3) or 3)
+
+    def _lr_schedule_label(self) -> str:
+        cfg = self.lr_schedule_cfg
+        if self.lr_scheduler is not None:
+            return (f"plateau(factor={cfg.get('plateau_factor', 0.5)}, "
+                    f"patience={self._plateau_patience()} epochs, min_lr={cfg.get('min_lr')})")
+        if not cfg.get('enabled') or cfg.get('name') in (None, 'none'):
+            return 'constant'
+        return (f"{cfg.get('name')}(min_lr={cfg.get('min_lr')}, "
+                f"warmup={cfg.get('warmup_epochs', 0)}, total={cfg.get('total_epochs', 0)}, "
+                f"milestones={cfg.get('milestones')}, gamma={cfg.get('gamma')})")
+
+    def _build_lr_scheduler(self):
+        """ReduceLROnPlateau instance (only for name == 'plateau'); the other schedules are computed
+        per epoch by _target_lr, which keeps the trajectory deterministic and independent of the
+        metric noise."""
+        cfg = self.lr_schedule_cfg
+        if not cfg.get('enabled') or cfg.get('name') != 'plateau':
+            return None
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max',
+            factor=float(cfg.get('plateau_factor', 0.5)),
+            patience=self._plateau_patience(),
+            min_lr=float(cfg.get('min_lr', 0.0) or 0.0),
+        )
+
+    def _target_lr(self, epoch: int) -> float:
+        """Deterministic learning rate of a 0-based epoch (cosine / step / warmup)."""
+        cfg = self.lr_schedule_cfg
+        base = self.base_lr
+        min_lr = float(cfg.get('min_lr', 0.0) or 0.0)
+        if not cfg.get('enabled') or cfg.get('name') in (None, 'none', 'plateau'):
+            return base
+
+        name = cfg.get('name')
+        warmup = int(cfg.get('warmup_epochs', 0) or 0)
+        if warmup > 0 and epoch < warmup:
+            return base * float(epoch + 1) / float(warmup)
+
+        if name == 'step':
+            milestones = cfg.get('milestones') or []
+            gamma = float(cfg.get('gamma', 0.3))
+            passed = sum(1 for m in milestones if epoch >= int(m))
+            return max(base * (gamma ** passed), min_lr)
+
+        if name == 'cosine':
+            total = int(cfg.get('total_epochs', 0) or 0)
+            if total <= warmup:
+                return base
+            progress = min(max(epoch - warmup, 0) / float(total - warmup), 1.0)
+            return min_lr + 0.5 * (base - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+        return base
+
+    def _apply_epoch_lr(self, epoch: int) -> float:
+        """Install this epoch's learning rate and return it (log value)."""
+        if self.lr_scheduler is not None:
+            # The plateau scheduler owns the learning rate: it must not be overwritten here.
+            return self._current_lr()
+        lr = self._target_lr(epoch)
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
+        return lr
+
+    def _current_lr(self) -> float:
+        return float(self.optimizer.param_groups[0]['lr'])
+
+    def _step_lr_scheduler(self, score, epoch) -> float:
+        """Feed the selection score to the plateau scheduler and record a real reduction."""
+        if self.lr_scheduler is None:
+            return self._current_lr()
+        lr_before = self._current_lr()
+        self.lr_scheduler.step(score)
+        lr_after = self._current_lr()
+        if lr_after < lr_before:
+            self.lr_events.append({'epoch': epoch, 'from': lr_before, 'to': lr_after})
+            print(f">> LR reduced after epoch {epoch+1}: {lr_before:.2e} -> {lr_after:.2e}")
+        return lr_after
 
     def _predict(self, link_indices, current_times):
         """Single inference entry point: hides the backbone-specific forward signature."""
@@ -536,7 +727,11 @@ class DynamicGraphTrainer:
 
     def train(self, num_epochs, save_path='best_dynamic_graph_model.pth', patience=10,
               max_factset_edges=None):
-        best_f1 = 0
+        # ONE unified criterion drives the checkpoint AND the early-stopping counter, so the two can
+        # no longer disagree (the historical implementation selected on the composite score but
+        # counted patience on the selection-split AUC, sharing a single counter).
+        patience = int(self.selection_cfg.get('patience') or patience)
+        best_score = 0.0
         best_epoch = 0
         best_auc = 0.0
         patience_counter = 0
@@ -551,10 +746,19 @@ class DynamicGraphTrainer:
             factset_display = max_factset_edges
         print(f"Factset edges: {len(self.factset_edges)} (actually used: {factset_display})")
         print(f"Margin Lambda: {self.margin_lambda}")
+        print(f"Selection criterion: {self.selection_criterion} "
+              f"({self.selection_split} split, early stopping patience={patience})")
+        print(f"Learning rate: base={self.base_lr:g}, schedule={self._lr_schedule_label()}, "
+              f"weight_decay={self.weight_decay:g}")
+        if self.lr_scheduler is not None and patience <= self._plateau_patience():
+            print(f"WARNING: early-stopping patience ({patience}) <= plateau patience "
+                  f"({self._plateau_patience()}): the learning rate will be reduced only after the "
+                  f"run has already stopped. Increase trainer.selection.patience.")
 
         try:
             for epoch in range(num_epochs):
                 epoch_start_time = time.time()
+                current_lr = self._apply_epoch_lr(epoch)
 
                 train_bce, train_margin, train_prec, train_rec, train_f1, train_auc = \
                     self.train_epoch(epoch, save_path=save_path)
@@ -574,8 +778,9 @@ class DynamicGraphTrainer:
                 self.epoch_durations.append(epoch_duration)
                 if self.use_tensorboard:
                     self.writer.add_scalar('Time/Epoch_Duration', epoch_duration, epoch)
+                    self.writer.add_scalar('Train/Epoch_LR', current_lr, epoch)
 
-                print(f"\nEpoch {epoch+1} summary ({epoch_duration:.1f}s):")
+                print(f"\nEpoch {epoch+1} summary ({epoch_duration:.1f}s, lr={current_lr:.3e}):")
                 print(f"Train - BCE: {train_bce:.4f}, Margin: {train_margin:.4f}, "
                       f"Precision: {train_prec:.4f}, Recall: {train_rec:.4f}, "
                       f"F1: {train_f1:.4f}, AUC: {train_auc:.4f}")
@@ -593,14 +798,13 @@ class DynamicGraphTrainer:
                         print(line)
 
                 # Model selection: the validation split when one is configured, the test split
-                # otherwise. The composite score is
-                #   0.5 * FactSet quantile + 0.5 * AUC(selection split).
+                # otherwise. A SINGLE criterion (see selection_score) drives both the checkpoint
+                # and the early-stopping counter; the FactSet quantile enters it only when
+                # selection.use_factset is true, but is always computed and logged.
                 select_auc = val_auc if self.val_loader is not None else test_auc
                 select_f1 = val_f1 if self.val_loader is not None else test_f1
-                current_score = select_f1
-                if factset_result is not None:
-                    factset_q = factset_result['quantile']
-                    current_score = 0.5 * factset_q + 0.5 * select_auc
+                selection = self.selection_score(select_auc, select_f1, factset_result)
+                current_score = selection['score']
 
                 test_factset = factset_result.get('test') if factset_result is not None else None
                 self.history.append({
@@ -623,11 +827,21 @@ class DynamicGraphTrainer:
                     'wasserstein_diff_test': test_factset.get('wasserstein_diff')
                     if test_factset else None,
                     'epoch_seconds': epoch_duration,
+                    'lr': current_lr,
+                    'selection_metric_ema': selection['ema_metric'],
+                    'factset_quantile_ema': selection['ema_factset'],
+                    'score_raw': selection['score_raw'],
                     'score': current_score,
                 })
 
-                if current_score > best_f1:
-                    best_f1 = current_score
+                if self.use_tensorboard:
+                    monitor = 'Monitor' if self.selection_split == 'val' else 'MonitorTest'
+                    self.writer.add_scalar(f'{monitor}/Selection_Score', selection['score_raw'], epoch)
+                    self.writer.add_scalar(f'{monitor}/Selection_Score_EMA', current_score, epoch)
+
+                improved = current_score > best_score
+                if improved:
+                    best_score = current_score
                     best_epoch = epoch
                     patience_counter = 0
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -639,21 +853,31 @@ class DynamicGraphTrainer:
                         'train_bce': train_bce,
                         'train_margin': train_margin,
                         'epoch_seconds': epoch_duration,
+                        'lr': current_lr,
                         'val_loss': val_loss,
                         'val_f1': val_f1,
                         'val_auc': val_auc,
                         'test_loss': test_loss,
                         'test_f1': test_f1,
                         'test_auc': test_auc,
+                        # Criterion bookkeeping: lets a downstream consumer recompute the score
+                        # from the stored metrics instead of guessing which protocol produced it.
+                        'selection_criterion': self.selection_criterion,
+                        'selection_score': current_score,
+                        'selection_score_raw': selection['score_raw'],
+                        'selection_metric': self.selection_cfg.get('metric', 'auc'),
+                        'selection_use_factset': bool(self.selection_cfg.get('use_factset', True)),
+                        'selection_ema_span': float(self.selection_cfg.get('ema_span', 1) or 1),
                     }
                     save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(save_dict, save_path)
-                    print(f"Saved best model (epoch {epoch+1}), composite score: {current_score:.4f} "
-                          f"({self.selection_split} split)")
+                    print(f"Saved best model (epoch {epoch+1}), {self.selection_criterion} = "
+                          f"{current_score:.4f} ({self.selection_split} split)")
                     best_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best.npy')
                     self.save_test_predictions_npy(best_npy_path, checkpoint_path=None)
 
-                # Additionally track the epoch with the highest AUC of the selection split
+                # Side product: the epoch with the highest raw AUC of the selection split. It never
+                # drives the early-stopping counter (that is the unified criterion's job).
                 if select_auc > best_auc:
                     best_auc = select_auc
                     auc_save_path = os.path.join(os.path.dirname(save_path), 'best_auc_model.pth')
@@ -665,12 +889,16 @@ class DynamicGraphTrainer:
                         'train_bce': train_bce,
                         'train_margin': train_margin,
                         'epoch_seconds': epoch_duration,
+                        'lr': current_lr,
                         'val_loss': val_loss,
                         'val_f1': val_f1,
                         'val_auc': val_auc,
                         'test_loss': test_loss,
                         'test_f1': test_f1,
                         'test_auc': test_auc,
+                        'selection_criterion': self.selection_criterion,
+                        'selection_score': current_score,
+                        'selection_score_raw': selection['score_raw'],
                     }
                     auc_save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(auc_save_dict, auc_save_path)
@@ -678,19 +906,28 @@ class DynamicGraphTrainer:
                           f"{self.selection_split} AUC: {select_auc:.4f}")
                     best_auc_npy_path = os.path.join(os.path.dirname(save_path), 'model_predictions_best_auc.npy')
                     self.save_test_predictions_npy(best_auc_npy_path, checkpoint_path=None)
-                else:
+
+                if not improved:
                     patience_counter += 1
                     if patience_counter >= patience:
-                        print(f"Early stopping triggered! Stopping training at epoch {epoch+1}")
+                        print(f"Early stopping triggered! Stopping training at epoch {epoch+1} "
+                              f"(no {self.selection_criterion} improvement for {patience} epochs)")
                         break
+
+                # Plateau scheduling reacts to the same unified criterion as the selection.
+                self._step_lr_scheduler(current_score, epoch)
 
         finally:
             if self.use_tensorboard:
                 self.writer.close()
 
-        print(f"\nTraining complete! Best epoch: {best_epoch+1}, best score: {best_f1:.4f} "
-              f"({self.selection_split} split)")
+        print(f"\nTraining complete! Best epoch: {best_epoch+1}, best score: {best_score:.4f} "
+              f"({self.selection_criterion}, {self.selection_split} split)")
+        if self.lr_events:
+            for event in self.lr_events:
+                print(f"  LR reduction: epoch {event['epoch']+1} "
+                      f"{event['from']:.2e} -> {event['to']:.2e}")
         if self.epoch_durations:
             print(f"Average epoch time: {float(np.mean(self.epoch_durations)):.1f}s "
                   f"over {len(self.epoch_durations)} epochs")
-        return best_epoch, best_f1
+        return best_epoch, best_score

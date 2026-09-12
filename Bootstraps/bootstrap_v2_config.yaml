@@ -37,6 +37,7 @@ data:
   # === Node feature construction ===
   # true -> X = [embedding | one-hot(country) | one-hot(industry_2nd) | one-hot(category_3rd)]
   # Vocabulary is built from the data at load time; attribute names must match the Neo4j schema.
+  # A missing attribute is encoded as an all-zero row of its block (no <NA> category).
   use_attr_onehot: true
   onehot_attrs:
     - country

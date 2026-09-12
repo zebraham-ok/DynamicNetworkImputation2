@@ -2,12 +2,14 @@
 """
 Four-metric figure: BCE Loss / AUC / Factset Quantile / Wasserstein Diff.
   - Reads TensorBoard events under results/
-  - When a (model, flag) has multiple runs, keeps the one with the most epochs
+  - When a (model, flag) has multiple runs: --multi-run longest (default) keeps the run with the
+    most epochs; --multi-run confidence keeps every run, so each curve is drawn as mean ± std over
+    the runs — this is how a seed ensemble (run_sampling.py --repeats N) becomes a CI band
   - Temp-SEAL logs per batch step -> its BCE/AUC curves go on the top (Step) axis, dashed;
     the epoch-only metrics and all other models stay on the bottom (Epoch) axis, solid
 Output: <figures>/fig_train_4metrics.png
       <figures>/fig_train_4metrics_check.png
-Usage: python Analysis/plot_train_4metrics.py [--out-dir DIR]
+Usage: python Analysis/plot_train_4metrics.py [--out-dir DIR] [--multi-run longest|confidence]
 """
 import os
 import matplotlib
@@ -28,6 +30,18 @@ def _resolve_out_dir():
     return (known.out_dir
             or os.environ.get('IMPUT_FIG_DIR')
             or os.path.join(_SCRIPT_DIR, 'figures'))
+
+
+def _resolve_multi_run():
+    """Run-selection policy: --multi-run first, else vr.MULTI_RUN_MODE (honours IMPUT_MULTI_RUN)."""
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--multi-run', choices=['longest', 'confidence'], default=None)
+    known, _ = parser.parse_known_args()
+    return known.multi_run or vr.MULTI_RUN_MODE
+
+
+MULTI_RUN_MODE = _resolve_multi_run()
 
 
 FIG_DIR = _resolve_out_dir()
@@ -65,7 +79,11 @@ def main():
                     ~((df_all['model'] == 'seal') & (df_all['flag'] == 'fff'))].copy()
     # Run selection is driven by the epoch-level tags only (batch steps would dominate the count);
     # the surviving runs are then re-expanded to their full tag set, batch mirrors included.
-    df = vr._filter_multi_run(df_all[~df_all['tag'].str.contains('/Batch_')], mode='longest')
+    print(f"  Multi-run mode: {MULTI_RUN_MODE}"
+          + (" (curves = mean ± std over all runs of a (model, flag))"
+             if MULTI_RUN_MODE == 'confidence' else " (longest run per (model, flag))"))
+    df = vr._filter_multi_run(df_all[~df_all['tag'].str.contains('/Batch_')],
+                              mode=MULTI_RUN_MODE)
     keep_runs = df[['model', 'flag', 'run_id']].drop_duplicates()
     df = df_all.merge(keep_runs, on=['model', 'flag', 'run_id'], how='inner')
     print(f"  {len(df)} records; models: {sorted(df['model'].unique())}")

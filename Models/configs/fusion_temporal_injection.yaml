@@ -1,0 +1,56 @@
+# ============================================================
+# Fusion option 3 - temporal injection (single branch) model-specific config
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+#
+# EvolveGCN-H's evolved operator W_t is injected between the GAT attention and the BiGRU:
+#     s_t = GAT_t(z);  W_t = MatGRU(W_{t-1}, mean_N(z));
+#     u_t = act(s_t @ W_t + A_t . (s_t @ W_t));  then BiGRU -> pair head ([B, 4*64+1] = 257).
+# Design doc: results/FUSION_DESIGN_OPTIONS_0912.md section 7.  Implementation: Models/fusion_temporal_injection.py
+#
+# Run (the YAML output.subdir only covers the default backbone, so -s is REQUIRED here):
+#   python SampleSetting/run_sampling.py -c fusion_temporal_injection -s fusion_temporal_injection -d cuda:0
+#   python Training/train_gatgru.py --config fusion_temporal_injection
+# ============================================================
+
+name: GAT-GRU-TI
+output_subdir: fusion_temporal_injection
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.fusion_temporal_injection
+  class: TemporalInjectionGATGRU
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1          # --num_rnn_layers 2 gives the 2-layer variant (as for GAT-GRU*)
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # "torch.*" strings are evaluated by utils.resolve_auto_kwargs (same convention as egcn.yaml).
+    activation: "torch.nn.ReLU()"
+    # Cut the gradient of the mean_N(z) evolution-driver branch so the operator gradient does not
+    # compete with the attention branch for the same representation (design doc section 7).
+    detach_global: true
+    # Second aggregation A_t . (s_t @ W_t) on top of the self-connection; false => plain s_t @ W_t.
+    use_adjacency: true
+    # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
+    # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
+    # NOTE: static_hidden_dim must equal the extractor output width (fc_embed_dim), because W_t
+    # transforms the GAT output while the operator is driven by mean_N(z) of the same width.
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

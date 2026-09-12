@@ -143,18 +143,37 @@ METRIC_DISPLAY = {
 }
 
 # When the same model+flag has multiple runs: 'longest' keeps only the run with the most epochs,
-# 'confidence' keeps all runs (agg draws confidence intervals as mean±std)
-MULTI_RUN_MODE = 'longest'
+# 'confidence' keeps all runs (every agg then draws mean ± std as a confidence band).
+# Seed ensembles (run_sampling.py --repeats N) land in exactly this case: N runs per (model, flag),
+# one per seed, so 'confidence' is what turns the seed ensemble into CIs on the curves.
+# Override per invocation with --multi-run, or with the IMPUT_MULTI_RUN environment variable.
+MULTI_RUN_MODE = os.environ.get('IMPUT_MULTI_RUN', 'longest')
+if MULTI_RUN_MODE not in ('longest', 'confidence'):
+    print(f"  [WARN] unknown IMPUT_MULTI_RUN={MULTI_RUN_MODE!r}, falling back to 'longest'")
+    MULTI_RUN_MODE = 'longest'
 
 
 def _filter_multi_run(df, mode='longest'):
     """
     Handle the case where a single (model, flag) pair has multiple run records.
     mode='longest':   keep only the one run_id with the most unique epochs per group
-    mode='confidence': keep all runs, no filtering
+    mode='confidence': keep all runs, no filtering (each curve becomes mean ± std over runs)
     """
     if mode == 'confidence':
-        return df.copy()
+        kept = df.copy()
+        # Make the aggregation visible: a band is only meaningful if it really pools several runs
+        counts = kept.groupby(['model', 'flag'])['run_id'].nunique()
+        multi = counts[counts > 1]
+        if len(multi):
+            print(f"  Multi-run aggregation (confidence): {len(multi)} (model, flag) groups pool "
+                  f"several runs -> curves are drawn as mean ± std")
+            if 'seed' in kept.columns and kept['seed'].notna().any():
+                seeds = sorted({int(s) for s in kept['seed'].dropna().unique()})
+                print(f"    seeds pooled: {seeds}")
+        else:
+            print("  Multi-run aggregation (confidence): no (model, flag) has more than one run, "
+                  "bands will be empty")
+        return kept
 
     run_epoch_counts = (
         df.groupby(['model', 'flag', 'run_id'])['epoch']
@@ -177,14 +196,31 @@ def _filter_multi_run(df, mode='longest'):
     return filtered
 
 
+# A restructured run directory is "<MMDD-HHMM>-<flag>", optionally carrying the seed of a repeated
+# run: "0912-1118-fff", "0912-1118-fff-s3" or "0912-1118-fff-seed3". Two seeds of the same
+# model+flag therefore appear as two runs, which is exactly what MULTI_RUN_MODE='confidence'
+# aggregates into a confidence band (see seed_ci_summary.py for the run-level directory form).
+RUN_NAME_RE = re.compile(r'(\d{4}-\d{4})-(f\w{2}|t\w{2})(?:-s(?:eed)?(\d+))?$')
+
+
 def parse_run_name(dirname):
     """
     Parse a directory name, e.g. "0714-1642-ftt" -> ('0714-1642', 'ftt')
+    An optional seed suffix ("0714-1642-ftt-s3") is tolerated and ignored here; use
+    parse_run_seed() to read it. The timestamp stays the run_id, so two seeds never collide.
     """
-    match = re.match(r'(\d{4}-\d{4})-(f\w{2}|t\w{2})$', dirname)
+    match = RUN_NAME_RE.match(dirname)
     if match:
         return match.group(1), match.group(2)
     return None, None
+
+
+def parse_run_seed(dirname):
+    """Seed encoded in a run directory name ("...-ftt-s3" / "...-ftt-seed3"), else None."""
+    match = RUN_NAME_RE.match(dirname)
+    if match and match.group(3) is not None:
+        return int(match.group(3))
+    return None
 
 
 def extract_scalars(event_dir, include_wall_time=False):
@@ -287,12 +323,14 @@ def collect_all_data():
                 continue
 
             scalars_wt = extract_scalars(run_dir, include_wall_time=True)
+            seed = parse_run_seed(run_dir.name)
             for tag, events in scalars_wt.items():
                 for step, value, _wall_time in events:
                     records.append({
                         'model': model,
                         'run_id': run_dir.name,
                         'flag': flag,
+                        'seed': seed,
                         'epoch': step,
                         'tag': tag,
                         'value': value,
@@ -308,6 +346,7 @@ def collect_all_data():
                     'model': model,
                     'run_id': run_dir.name,
                     'flag': flag,
+                    'seed': seed,
                     'epoch': 0,  # aggregate value, step not applicable
                     'tag': 'Time/Epoch_Duration',
                     'value': avg_dur,
@@ -398,6 +437,154 @@ def get_best_epoch_metrics(df):
                 })
 
     return pd.DataFrame(best_rows)
+
+
+def get_best_epoch_metrics_per_run(df):
+    """Per (model, flag, run_id) best-epoch metrics, i.e. get_best_epoch_metrics split per run.
+
+    This is the honest way to summarise a seed ensemble: each run selects its own best epoch using
+    its own criterion, and only the selected values are averaged afterwards. Taking a single
+    argmax over all runs of a (model, flag) would instead report the best of N seeds, which is an
+    upward-biased (order-statistic) number rather than an estimate of typical performance.
+    """
+    best_rows = []
+    for model in df['model'].unique():
+        mt = MODEL_METRIC_TAGS.get(model, {})
+        criterion_tag = mt.get('best_criterion', 'Test/Epoch_AUC')
+        direction = mt.get('best_direction', 'max')
+
+        criterion_df = df[(df['tag'] == criterion_tag) & (df['model'] == model)]
+        if criterion_df.empty:
+            for fb_tag, fb_dir in [('Test/Epoch_AUC', 'max'), ('Test/Epoch_F1', 'max'),
+                                   ('Val/Epoch_Precision', 'max'), ('Val/Epoch_Loss', 'min'),
+                                   ('Train/Epoch_Loss', 'min')]:
+                criterion_df = df[(df['tag'] == fb_tag) & (df['model'] == model)]
+                if not criterion_df.empty:
+                    criterion_tag, direction = fb_tag, fb_dir
+                    break
+            if criterion_df.empty:
+                continue
+
+        for (flag, run_id), group in criterion_df.groupby(['flag', 'run_id']):
+            if direction == 'max':
+                best = group.loc[group['value'].idxmax()]
+            else:
+                best = group.loc[group['value'].idxmin()]
+            best_epoch = best['epoch']
+
+            epoch_data = df[(df['model'] == model) &
+                            (df['flag'] == flag) &
+                            (df['run_id'] == run_id) &
+                            (df['epoch'] == best_epoch)]
+            for _, row in epoch_data.iterrows():
+                best_rows.append({
+                    'model': model,
+                    'flag': flag,
+                    'run_id': run_id,
+                    'seed': row.get('seed'),
+                    'best_epoch': best_epoch,
+                    'tag': row['tag'],
+                    'value': row['value'],
+                })
+
+    return pd.DataFrame(best_rows)
+
+
+# Metrics worth reporting as a seed aggregate (subset of the tags in the per-run table)
+SEED_CI_TAGS = ['Test/Epoch_AUC', 'Test/Epoch_F1', 'Test/Epoch_Loss',
+                'Monitor/Factset_Quantile', 'Monitor/Wasserstein_Diff']
+
+
+def aggregate_best_metrics(per_run_df, ci=True):
+    """Collapse the per-run best metrics into mean ± 95% CI per (model, flag, tag).
+
+    Returns a frame with the same columns as get_best_epoch_metrics (so plot_summary_table can
+    consume it directly, with 'value' = mean over runs) plus 'std', 'ci95', 'n' and 'best_epoch'
+    (mean of the per-run best epochs).
+    """
+    if per_run_df is None or per_run_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (model, flag, tag), group in per_run_df.groupby(['model', 'flag', 'tag']):
+        values = group['value'].dropna().to_numpy(dtype=float)
+        n = len(values)
+        if n == 0:
+            continue
+        mean = float(values.mean())
+        std = float(values.std(ddof=1)) if n > 1 else np.nan
+        if ci and n > 1 and np.isfinite(std):
+            ci95 = float(_T95_TABLE.get(n - 1, 1.96) * std / np.sqrt(n))
+        else:
+            ci95 = np.nan
+        rows.append({
+            'model': model,
+            'flag': flag,
+            'tag': tag,
+            'value': mean,
+            'std': std,
+            'ci95': ci95,
+            'n': n,
+            'best_epoch': float(group['best_epoch'].mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def report_seed_ci(per_run_df, err_df, out_dir=None):
+    """Print and persist the across-run aggregate that the paper table is built from.
+
+    Writes <out_dir>/seed_ci_per_run.csv (one row per run: the value selected in its own best
+    epoch) and <out_dir>/seed_ci_summary.csv (mean, std, 95% CI half-width, number of runs), so the
+    numbers in the manuscript can always be traced back to the individual repeats.
+    """
+    out_dir = out_dir or OUTPUT_DIR
+    if per_run_df is None or per_run_df.empty or err_df is None or err_df.empty:
+        print("  [WARN] no per-run best-epoch metrics found; skipping the seed aggregate")
+        return None
+
+    runs_per_group = per_run_df.groupby(['model', 'flag'])['run_id'].nunique()
+    seeds = []
+    if 'seed' in per_run_df.columns and per_run_df['seed'].notna().any():
+        seeds = sorted({int(s) for s in per_run_df['seed'].dropna().unique()})
+    print(f"  Runs per (model, flag): min={int(runs_per_group.min())}, "
+          f"max={int(runs_per_group.max())}"
+          + (f" | seeds: {seeds}" if seeds else
+             " | no seed suffix in the run names (add '-s<seed>' when restructuring)"))
+    if int(runs_per_group.min()) < 2:
+        print("  [WARN] at least one (model, flag) has a single run -> its CI is undefined ('n/a')")
+    if seeds:
+        mix = per_run_df.groupby(['model', 'flag'])['seed'].agg(
+            lambda s: bool(s.notna().any() and s.isna().any()))
+        mix = mix[mix]
+        if len(mix):
+            print("  [WARN] these (model, flag) groups mix seeded and unseeded runs, so the aggregate "
+                  "pools a seed ensemble with a separate run: "
+                  + ', '.join(f"{m}/{f}" for m, f in mix.index))
+
+    print(f"\n  {'Method':<12} {'Flag':<6} {'Metric':<28} {'Mean':>10} {'±95%CI':>9} {'Runs':>5}")
+    print(f"  {'-' * 76}")
+    for _, r in err_df[err_df['tag'].isin(SEED_CI_TAGS)].sort_values(
+            ['model', 'flag', 'tag']).iterrows():
+        ci = 'n/a' if not np.isfinite(r['ci95']) else f"{r['ci95']:.4f}"
+        print(f"  {MODEL_DISPLAY.get(r['model'], r['model']):<12} "
+              f"{FLAG_SHORT.get(r['flag'], r['flag']):<6} {r['tag']:<28} "
+              f"{r['value']:>10.4f} {ci:>9} {int(r['n']):>5}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    per_run_path = os.path.join(out_dir, 'seed_ci_per_run.csv')
+    summary_path = os.path.join(out_dir, 'seed_ci_summary.csv')
+    per_run_df.to_csv(per_run_path, index=False)
+    err_df.to_csv(summary_path, index=False)
+    print(f"\n  Per-run best metrics            : {per_run_path}")
+    print(f"  Seed aggregate (mean ± 95% CI)  : {summary_path}")
+    return err_df
+
+
+# Two-sided 95% t quantiles by degrees of freedom (small-sample table for seed ensembles)
+_T95_TABLE = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+              8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+              15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+              22: 2.074, 24: 2.064, 26: 2.056, 28: 2.048, 30: 2.042}
 
 
 def get_model_colors():
@@ -902,8 +1089,13 @@ def plot_per_model_comparison(df):
         print(f"  Saved: {fname}")
 
 
-def plot_summary_table(best_df, epoch_df):
-    """Create a colored summary table figure (including Wasserstein_Diff and mean epoch duration)"""
+def plot_summary_table(best_df, epoch_df, err_df=None, err_label='95% CI'):
+    """Create a colored summary table figure (including Wasserstein_Diff and mean epoch duration)
+
+    err_df: optional seed aggregate from aggregate_best_metrics(). When given, the values in best_df
+    are means over the repeats and every metric cell is annotated with its across-seed uncertainty
+    (half-width of the err_label interval), with the number of runs stated in the title.
+    """
     # Monitor/* now describes the validation split that drives early stopping, while the table
     # reports the held-out test split. Newer runs therefore log the test-split FactSet statistics
     # under MonitorTest/*; legacy runs only have Monitor/*, which is what the fallback keeps.
@@ -928,6 +1120,18 @@ def plot_summary_table(best_df, epoch_df):
     if time_tag in epoch_df['tag'].unique():
         time_sub = epoch_df[epoch_df['tag'] == time_tag]
         time_per_key = time_sub.groupby(['model', 'flag'])['value'].mean().to_dict()
+
+    # Optional across-seed uncertainty per (model, flag, tag)
+    err_map = {}
+    n_runs = 0
+    if err_df is not None and not err_df.empty:
+        err_col = 'ci95' if 'ci95' in err_df.columns else ('std' if 'std' in err_df.columns else None)
+        if err_col is not None:
+            for _, row in err_df.iterrows():
+                if np.isfinite(row[err_col]):
+                    err_map[(row['model'], row['flag'], row['tag'])] = float(row[err_col])
+        if 'n' in err_df.columns and len(err_df):
+            n_runs = int(np.nanmax(err_df['n'].to_numpy(dtype=float)))
 
     row_keys = []
     for model in sorted(best_df['model'].unique()):
@@ -968,8 +1172,10 @@ def plot_summary_table(best_df, epoch_df):
     n_rows, n_cols = data_arr.shape
     fig, ax = plt.subplots(figsize=(3.6 * n_cols, 0.5 * n_rows + 2.0))
     ax.axis('off')
-    ax.set_title('Best Epoch Metrics Summary', fontsize=14, fontweight='bold',
-                 pad=20)
+    title = 'Best Epoch Metrics Summary'
+    if err_map:
+        title += f' (mean ± {err_label} over {n_runs} runs)'
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
 
     # Normalize each metric column for coloring (the duration column is handled separately)
     cell_colors = np.zeros((n_rows, n_cols, 3))
@@ -1023,10 +1229,16 @@ def plot_summary_table(best_df, epoch_df):
 
     cell_text = []
     for r in range(n_rows):
+        model, flag = row_keys[r]
         row_text = []
         for c in range(n_cols):
             is_time = has_time and c == n_cols - 1
-            row_text.append(_fmt_val(data_arr[r, c], is_time=is_time))
+            text = _fmt_val(data_arr[r, c], is_time=is_time)
+            if not is_time and c < n_metric_cols:
+                err = err_map.get((model, flag, available_tags[c]))
+                if err is not None:
+                    text += f"\n\u00b1{err:.3f}"
+            row_text.append(text)
         cell_text.append(row_text)
 
     table = ax.table(cellText=cell_text, rowLabels=row_labels, colLabels=col_labels,
@@ -1514,7 +1726,19 @@ def plot_wasserstein_scatter(hist_data):
 
 
 def main():
+    args = parse_args()
+    global MULTI_RUN_MODE
+    MULTI_RUN_MODE = args.multi_run
+    if args.seed_ci and MULTI_RUN_MODE != 'confidence':
+        print(f"  [INFO] --seed-ci needs every run of a (model, flag): switching multi-run mode "
+              f"'{MULTI_RUN_MODE}' -> 'confidence'")
+        MULTI_RUN_MODE = 'confidence'
+
     print("  Temporal Network Internal Data Imputation — Results Visualization")
+    if MULTI_RUN_MODE == 'confidence':
+        print("  Multi-run mode: confidence — curves are mean ± std over all runs of a (model, flag)")
+    else:
+        print("  Multi-run mode: longest — only the longest run per (model, flag) is plotted")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -1534,6 +1758,16 @@ def main():
     best_df = get_best_epoch_metrics(epoch_df)
     print(f"  Best-metric records: {len(best_df)}")
 
+    err_df = None
+    if args.seed_ci:
+        print("\n[2b/7] Aggregating the per-run best metrics (seed ensemble)...")
+        per_run_df = get_best_epoch_metrics_per_run(epoch_df)
+        err_df = aggregate_best_metrics(per_run_df)
+        report_seed_ci(per_run_df, err_df)
+        if not err_df.empty:
+            # The table then shows across-seed means instead of one run's best epoch
+            best_df = err_df.copy()
+
     print("\n[3/7] Plotting training loss line plots...")
     plot_training_loss(epoch_df)
 
@@ -1544,7 +1778,7 @@ def main():
     plot_per_model_comparison(epoch_df)
 
     print("\n[6/7] Plotting summary table...")
-    plot_summary_table(best_df, epoch_df)
+    plot_summary_table(best_df, epoch_df, err_df=err_df)
     plot_config_legend()
 
     print("\n[7/7] Plotting score distributions and Wasserstein scatter...")
@@ -1553,6 +1787,22 @@ def main():
     plot_wasserstein_scatter(hist_data)
 
     print(f"\n  Visualization complete! Output directory: {OUTPUT_DIR}")
+
+
+def parse_args():
+    """CLI: --multi-run selects the run-selection policy, --seed-ci adds the across-seed aggregate."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Visualize the TensorBoard results under results/')
+    parser.add_argument('--multi-run', choices=['longest', 'confidence'], default=MULTI_RUN_MODE,
+                        help="policy when a (model, flag) has several runs (e.g. a seed ensemble): "
+                             "'longest' keeps the run with the most epochs, 'confidence' keeps all "
+                             "runs so every curve is drawn as mean ± std")
+    parser.add_argument('--seed-ci', action='store_true',
+                        help='additionally aggregate the per-run best metrics into mean ± 95%% CI '
+                             '(per-run CSV + summary CSV + annotated summary table); implies '
+                             "--multi-run confidence")
+    return parser.parse_args()
 
 
 if __name__ == '__main__':

@@ -23,7 +23,8 @@ dataset:
   # Combined with the shared feature extractor (model.kwargs.use_fc_embedding) this turns the
   # projection into a real dimensionality reduction instead of a 128 -> 128 re-encoder.
   # Attribute names must match the Neo4j schema of the graph being read (anonymised releases
-  # may use different property names). The vocabulary is derived from the data at load time.
+  # may use different property names). The vocabulary is derived from the data at load time;
+  # a missing / empty attribute is encoded as an all-zero row of its block (no <NA> category).
   use_attr_onehot: true
   onehot_attrs:
     - country
@@ -50,8 +51,36 @@ toy_mode: false                     # enable toy mode (quick validation on a sma
 # --- Trainer ---
 trainer:
   num_epochs: 60                    # number of training epochs
-  patience: 10                      # early-stopping patience
+  patience: 10                      # early-stopping patience (fallback: see selection.patience)
   max_factset_edges: 5000           # factset sampling cap (null=all)
+
+  # --- Model selection + early stopping: ONE unified criterion (see Training/trainer_common.py) ---
+  # score = smooth(metric)                                        when use_factset is false
+  # score = 0.5 * smooth(FactSet quantile) + 0.5 * smooth(metric)  when use_factset is true
+  # The same score drives the checkpoint AND the early-stopping counter, so the two can no longer
+  # disagree. The FactSet quantile is ALWAYS computed and logged (it is reported in the result
+  # table); use_factset only decides whether it enters the selection score.
+  selection:
+    use_factset: false              # false = select on the ranking metric only (FSQ still logged)
+    metric: auc                     # auc | f1, computed on the selection split (val when available)
+    ema_span: 5                     # exponential-moving-average span; <=1 disables the smoothing
+    patience: 15                    # early-stopping budget (epochs); null -> trainer.patience
+                                    # keep it > lr_schedule.plateau_patience
+
+  # --- Learning-rate schedule (dynamic graph trainer only; SEALTrainer has its own) ---
+  # base_lr is the initial learning rate and is honoured even when the schedule is disabled.
+  lr_schedule:
+    enabled: true
+    name: cosine                    # cosine | step | plateau | none
+    base_lr: 0.0005                 # initial learning rate
+    min_lr: 0.00001                 # lower bound of the schedule
+    warmup_epochs: 2                # linear warmup (epochs) towards base_lr
+    total_epochs: 20                # cosine period (epochs)
+    milestones: [4, 9]              # step schedule: epochs where the lr is multiplied by gamma
+    gamma: 0.3                      # step schedule: decay factor
+    plateau_factor: 0.3             # plateau schedule: decay factor
+    plateau_patience: 3             # plateau schedule: tolerance in EPOCHS (must be < patience)
+
   kwargs:
     use_tensorboard: true
     margin_lambda: 0.1              # BCE + MarginRankingLoss weight

@@ -1,0 +1,63 @@
+# ============================================================
+# Fusion option 4 - FiLM modulation (single branch, cheapest) model-specific config
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+#
+# The evolved operator is NOT allowed to rewrite the representation; it only produces a per-year
+# (gamma_t, beta_t) pair that modulates the attention output:
+#     s_t = GAT_t(z);  g_t = drift summary;  (gamma_t, beta_t) = MLP(g_t);
+#     s'_t = (1 + gamma_t) * s_t + beta_t;  then BiGRU -> pair head ([B, 4*64+1] = 257).
+# The MLP's last layer is zero-initialised, so at init (gamma, beta) = 0 and s'_t = s_t exactly:
+# the model starts life as the plain GAT-GRU baseline.
+# Design doc: results/FUSION_DESIGN_OPTIONS_0912.md section 8.  Implementation: Models/fusion_film.py
+#
+# Run (the YAML output.subdir only covers the default backbone, so -s is REQUIRED here):
+#   python SampleSetting/run_sampling.py -c fusion_film -s fusion_film -d cuda:0
+#   python Training/train_gatgru.py --config fusion_film
+# ============================================================
+
+name: GAT-GRU-FiLM
+output_subdir: fusion_film
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.fusion_film
+  class: FiLMGATGRU
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1          # --num_rnn_layers 2 gives the 2-layer variant (as for GAT-GRU*)
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # Where the drift summary g_t comes from:
+    #   weights   -> g_t = mean_dim0(W_t) with W_t = MatGRU(W_{t-1}, mean_N(z)) (EvolveGCN-H recipe,
+    #                "operator drift" reading, costs one MatGRU = +0.163 M at 128x128)  <-- default
+    #   attention -> g_t = mean_N(s_t); costs nothing extra and is still time-varying (A_t changes)
+    # Not offered: summary of mean_N(z), which the shared (time-invariant) extractor makes constant
+    # over t and would therefore disable the per-time-step modulation entirely.
+    summary_mode: weights
+    mlp_hidden: 256
+    # true  -> s' = (1 + gamma) * s + beta  (identity at init, the design-doc form)
+    # false -> s' = gamma * s + beta
+    film_unit_offset: true
+    # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
+    # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
+    # NOTE: unlike option 3, no width constraint between static_hidden_dim and the extractor output
+    # width (only statistics are read out of W_t).
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

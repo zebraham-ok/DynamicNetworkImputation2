@@ -83,8 +83,9 @@ class CompanySupplyDataset(Dataset):
                 an actual dimensionality reduction instead of a 128 -> 128 re-encoder.
             onehot_attrs: Neo4j property names to one-hot encode, e.g. ['country', 'industry_2nd', 'category_3rd'].
                 The vocabulary is built from the data at load time (sorted for reproducibility), so no
-                vocabulary file has to be shipped with the dataset. An explicit ``<NA>`` category is
-                reserved at index 0 so that nodes with a missing attribute are still distinguishable.
+                vocabulary file has to be shipped with the dataset. A missing / empty attribute is
+                encoded as an all-zero row of that block (no ``<NA>`` category is reserved), so the
+                block width equals the number of distinct non-empty values.
         """
         self.embedding_name = embedding_name
         self.negative_ratio = negative_ratio
@@ -209,11 +210,13 @@ class CompanySupplyDataset(Dataset):
         """Build the optional one-hot attribute blocks that are appended to the node embedding.
 
         The vocabulary is derived from the data itself and sorted, so the encoding is
-        reproducible without shipping a vocabulary file.  Index 0 of every block is reserved
-        for a missing / empty value (``<NA>``), therefore each node has exactly one active
-        column per block and "attribute missing" is distinguishable from "attribute = other".
+        reproducible without shipping a vocabulary file.  A **missing / empty attribute is
+        encoded as an all-zero row** (no column of that block is activated), so the block is a
+        pure value encoding and no "missing" category is invented.  Note the two consequences:
+        (1) every block has exactly ONE active column for a present value and none for a
+        missing one, so node rows are no longer guaranteed to have a unit row sum;
+        (2) for an attribute that is mostly missing, most rows of its block are zero.
         """
-        missing_token = '<NA>'
         attr_list = self.onehot_attrs
         raw_values = [[] for _ in attr_list]
         seen_ids = []
@@ -229,12 +232,11 @@ class CompanySupplyDataset(Dataset):
         blocks = []
         offset = 0
         for name, values in zip(attr_list, raw_values):
-            normalised = [missing_token if v is None or v == '' else str(v) for v in values]
-            categories = sorted({v for v in normalised if v != missing_token})
-            categories = [missing_token] + categories
+            normalised = [None if v is None or v == '' else str(v) for v in values]
+            categories = sorted({v for v in normalised if v is not None})
             index_of = {c: j for j, c in enumerate(categories)}
 
-            if len(categories) <= 1:
+            if not categories:
                 raise ValueError(
                     f"onehot_attrs entry '{name}' has no value at all (all {len(normalised)} nodes are "
                     f"NULL/empty). Check that the property name matches the Neo4j schema "
@@ -243,7 +245,8 @@ class CompanySupplyDataset(Dataset):
 
             block = np.zeros((len(normalised), len(categories)), dtype=np.float32)
             for row, value in enumerate(normalised):
-                block[row, index_of[value]] = 1.0
+                if value is not None:  # missing attribute -> keep the all-zero row
+                    block[row, index_of[value]] = 1.0
 
             blocks.append(block)
             self.attr_onehot_vocabs[name] = categories
@@ -266,7 +269,7 @@ class CompanySupplyDataset(Dataset):
         blocks = ", ".join(f"{name}={self.attr_onehot_sizes[name]}" for name in self.onehot_attrs)
         total = embedding_dim + self.attr_onehot_dim
         return (f"[Features] X = embedding({embedding_dim}) + one-hot[{blocks}] "
-                f"= {total} (attribute one-hot ENABLED)")
+                f"= {total} (attribute one-hot ENABLED; missing attribute -> all-zero row)")
 
     def _build_year_distribution(self):
         """Build year-distribution info for uniform sampling (align to the year with the fewest samples, avoiding year bias and leakage)"""
@@ -561,6 +564,8 @@ def assemble_node_features(full_set: CompanySupplyDataset) -> torch.Tensor:
     X = [ dense text embedding | optional one-hot attribute blocks ] with the row order given by
     ``full_set.reverse_node_mapping`` (i.e. PyG node index -> neo4j id).  This is the single place
     where node features are materialised, so training and bootstrap reuse exactly the same layout.
+    A node whose attribute is missing contributes an all-zero row for that block, so the width of
+    X is fixed by the vocabulary but individual rows are not full one-hot encodings.
     """
     reverse_node_mapping = full_set.reverse_node_mapping
     company_embeddings = full_set.company_embeddings

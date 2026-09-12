@@ -95,6 +95,11 @@ if __name__ == "__main__":
         factset_edges=factset_edges,
         node_mapping=node_mapping,
         reverse_node_mapping=reverse_node_mapping,
+        # Unified selection criterion (trainer.selection) + learning-rate schedule
+        # (trainer.lr_schedule): keeps this single-config entry point on exactly the same protocol
+        # as SampleSetting/run_sampling.py, so their numbers stay comparable.
+        selection_cfg=trainer_cfg.get('selection'),
+        lr_schedule_cfg=trainer_cfg.get('lr_schedule'),
     )
 
     train_kwargs = {

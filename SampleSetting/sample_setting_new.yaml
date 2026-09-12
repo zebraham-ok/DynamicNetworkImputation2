@@ -5,7 +5,7 @@
 
 # ---- Basic settings ----
 defaults:
-  config: gatgru_vec             # default model config name
+  config: fusion_film             # default model config name; any file under Models/configs/: gatgru_vec (GAT-GRU, 1-layer BiGRU, paper main model) | gatgru_1dire (GAT-GRU, unidirectional) | bigru_vec (Node-GRU) | egcn (EvolveGCN-H) | tna_vec (TNA) | seal (Temp-SEAL, different forward signature => uses SEALTrainer) | fusion_temporal_injection (fusion opt.3, temporal injection => run with -s fusion_temporal_injection) | fusion_film (fusion opt.4, FiLM => run with -s fusion_film)
   device: auto                   # auto / cuda / cpu
   backbone_donor: 0              # mode index of the backbone donor (0-based)
   seed: 42                       # global random seed of the first repeat
@@ -54,11 +54,11 @@ sampling_modes:
     intra_industry_neg: false
     use_pred_neg: false
 
-  - name: tff
-    desc: "filter_factset=true, intra_industry=false, use_pred_neg=false"
-    filter_factset_neg: true
+  - name: fft
+    desc: "filter_factset=false, intra_industry=false, use_pred_neg=true"
+    filter_factset_neg: false
     intra_industry_neg: false
-    use_pred_neg: false
+    use_pred_neg: true
 
 # ---- Model parameter overrides (optional) ----
 # The command-line --num_rnn_layers overrides the value here.
@@ -74,5 +74,5 @@ model_overrides:
 # ---- Output settings ----
 output:
   root: results                   # results root directory, relative to the repo root
-  subdir: gatgru                  # model subdirectory
+  subdir: fusion_film                  # model subdirectory
   prefix: sampling                # output directory prefix → sampling_{timestamp}[_rnnN]
