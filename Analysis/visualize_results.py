@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """
 Results visualization script: reads TensorBoard event files under results/ and produces line plots and heatmaps.
-Usage: python Analysis/visualize_results.py
-Output: Analysis/visualization/
+
+The results root and the output directory are configurable, so the same script can be pointed at a
+foldered results tree (e.g. results/单次4模式 for the single-run suite, or a seed ensemble) without
+moving files around:
+
+    python Analysis/visualize_results.py --results-dir results/单次4模式 --out-dir Analysis/visualization
+    python Analysis/visualize_results.py --results-dir results/四次双模式/confidence \
+        --multi-run confidence --seed-ci --out-dir Analysis/visualization_ci
+
+Usage: python Analysis/visualize_results.py [--results-dir DIR] [--out-dir DIR]
+Output: <out-dir>/ (default Analysis/visualization/)
+
+Split convention of every figure (2026-09-13): loss curves are drawn from the TRAIN split, every
+other curve from the VALIDATION split — the split that selects the epoch and stops training — and
+each validation curve stars the epoch the selection landed on. The TEST split is reported as a
+single number per cell in summary_table.png (MonitorTest/*), so no line figure mixes splits.
 """
 
 import os
@@ -34,9 +48,48 @@ for _font_name in ['Microsoft YaHei', 'SimHei', 'DengXian']:
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import plot_models  # noqa: E402  (Analysis/plot_models.py, stdlib-only)
+
 BASE_DIR = Path(__file__).resolve().parent.parent  # repository root
-RESULTS_DIR = BASE_DIR / 'results'
-OUTPUT_DIR = BASE_DIR / 'Analysis' / 'visualization'
+
+# Results root and output directory. The layout under RESULTS_DIR must be
+#     <RESULTS_DIR>/<model>/<MMDD-HHMM>-<flag>[-s<seed>]/events.out.tfevents.*
+# so a foldered tree such as results/单次4模式 has to be passed explicitly (--results-dir).
+# IMPUT_RESULTS_DIR / IMPUT_OUT_DIR let importing scripts (Analysis/plot_train_4metrics.py)
+# share the same override without any extra plumbing.
+RESULTS_DIR = Path(os.environ.get('IMPUT_RESULTS_DIR') or (BASE_DIR / 'results')).resolve()
+OUTPUT_DIR = Path(os.environ.get('IMPUT_OUT_DIR') or (BASE_DIR / 'Analysis' / 'visualization')).resolve()
+
+
+def set_paths(results_dir=None, out_dir=None):
+    """Redirect RESULTS_DIR / OUTPUT_DIR (used by --results-dir / --out-dir in main())."""
+    global RESULTS_DIR, OUTPUT_DIR
+    if results_dir:
+        RESULTS_DIR = Path(results_dir).resolve()
+    if out_dir:
+        OUTPUT_DIR = Path(out_dir).resolve()
+    refresh_model_display()
+    return RESULTS_DIR, OUTPUT_DIR
+
+
+def refresh_model_display(verbose=True):
+    """Re-derive MODEL_DISPLAY from <results root>/model_plot_config.json for the current RESULTS_DIR.
+
+    Called by set_paths() so every consumer (this module, plot_train_4metrics.py, ...) sees the same
+    selection as soon as --results-dir is known. With no config file MODEL_DISPLAY stays the built-in
+    table, i.e. exactly the pre-config behaviour.
+    """
+    available = None
+    if RESULTS_DIR.is_dir():
+        available = [p.name for p in RESULTS_DIR.iterdir() if p.is_dir()]
+    names = plot_models.active_models(BUILTIN_MODEL_DISPLAY, available=available,
+                                      results_dir=RESULTS_DIR, config_path=(MODEL_CONFIG or None),
+                                      verbose=verbose)
+    MODEL_DISPLAY.clear()
+    MODEL_DISPLAY.update(names)
+    return MODEL_DISPLAY
+
 
 # SampleSetting/sample_setting.yaml is the single source of truth for the ftt/ftf/fff/tff
 # switch combinations; the legend below is rendered from it so the two can never drift apart.
@@ -61,28 +114,74 @@ FLAG_SHORT = {
     'tff': 'tff',
 }
 
+# Negative-sampling flag -> title of one block of the side-by-side summary table. Same vocabulary as
+# Analysis/plot_train_4metrics.py::SETTING_LABELS (it imports this module, so the map lives here).
+FLAG_PANEL = {
+    'ftt': 'Intra-Indus + NoSup (ftt)',
+    'ftf': 'Intra-Indus negatives (ftf)',
+    'fff': 'All-Rand negatives (fff)',
+    'tff': 'Factset-Filter negatives (tff)',
+}
+
 DIFFICULTY_ORDER = {'ftt': 0, 'ftf': 1, 'fff': 2, 'tff': 3}
 
-MODEL_DISPLAY = {
+# Operating-point thresholds (Youden's J / F1-max) for the summary table. The seed-CI pass writes
+# Analysis/npy_roc_output_ci/roc_ci_summary.csv from the saved test-set score arrays, and that is the
+# table the ROC-with-CI figures and roc_ci_summary.md quote, so it wins. The per-run
+# model_predictions_best_thresholds.json files are the fallback (same scan definition, written by the
+# same helper) for a results tree that never went through Analysis/seed_ci_figures.py.
+THR_CSV_CANDIDATES = (
+    BASE_DIR / 'Analysis' / 'npy_roc_output_ci' / 'roc_ci_summary.csv',
+)
+
+# Every model this project can plot. Doubles as the fallback whitelist when there is no plot config.
+BUILTIN_MODEL_DISPLAY = {
     'bigru': 'BiGRU',
     'egcn': 'EvolveGCN-H',
+    # 0913-2134: identical to 'egcn' except trainer.kwargs.label_smoothing = 0.1
+    'egcn-smooth': 'EvolveGCN-H-LS',
     'gatgru': 'GAT-GRU',
+    # 0913-0911: GAT-GRU-Vec with num_rnn_layers = 2
+    'gatgru2layer': 'GAT-GRU*',
+    # 0913-1951: the two-layer GAT-GRU with trainer.kwargs.label_smoothing = 0.1
+    'gatgru2layer-smooth': 'GAT-GRU-LS',
     'tna': 'BiTNA',
     'seal': 'SEAL',
+    # Attribute-fusion variants of run_sampling.py (FiLMGATGRU): the 0912-1936 repeat overrides
+    # num_rnn_layers=2, hence the '*' suffix used for the two-layer backbone everywhere else.
+    'fusion1layer': 'GAT-GRU-FiLM',
+    'fusion2layer': 'GAT-GRU*-FiLM',
 }
+
+# The *active* table: rewritten in place by refresh_model_display() from the plot config JSON, so the
+# whole pipeline (this module and everything importing MODEL_DISPLAY) picks up the selection without
+# any extra plumbing. Dropping a model from every figure = commenting one line in that JSON.
+MODEL_DISPLAY = dict(BUILTIN_MODEL_DISPLAY)
+
+# Explicit --model-config / $IMPUT_MODEL_CONFIG; empty = look next to the results root.
+MODEL_CONFIG = os.environ.get(plot_models.ENV_VAR, '')
 
 MODEL_BASE_COLORS = {
     'bigru': 'Blues',
     'egcn': 'Greens',
+    'egcn-smooth': 'cool',
     'gatgru': 'Oranges',
+    'gatgru2layer': 'YlOrBr',
+    'gatgru2layer-smooth': 'spring',
     'tna': 'Purples',
     'seal': 'RdPu',
+    'fusion1layer': 'Reds',
+    'fusion2layer': 'cividis',
 }
 
 # Shade position of each of the 4 configs per model (deep->light, i.e. ftt->tff)
 SHADE_POSITIONS = [0.9, 0.7, 0.575, 0.45]
 
 # Per-model spec: {concept: actual tag}
+# Split convention of EVERY line figure (the summary table is the only place where test numbers
+# appear): loss curves come from the TRAIN split, every other curve from the VALIDATION split —
+# the split that selects the epoch and stops training. No figure mixes a train curve with a test
+# curve any more, and the epoch finally selected is starred on every validation curve.
 # best_criterion is the validation AUC: under the standard protocol the validation split selects
 # the epoch and the test split is only reported. Runs produced before that switch have no
 # Val/Epoch_AUC curve, in which case get_best_epoch_metrics() falls back to Test/Epoch_AUC.
@@ -90,36 +189,76 @@ MODEL_METRIC_TAGS = {
     'bigru': {
         'train_loss': 'Train/Epoch_BCE',
         'train_loss2': 'Train/Epoch_Margin',
-        'test_auc': 'Test/Epoch_AUC',
-        'test_f1': 'Test/Epoch_F1',
-        'test_loss': 'Test/Epoch_Loss',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
         'best_criterion': 'Val/Epoch_AUC',  # fallback: Test/Epoch_AUC (legacy runs)
         'best_direction': 'max',
     },
     'egcn': {
         'train_loss': 'Train/Epoch_BCE',
         'train_loss2': 'Train/Epoch_Margin',
-        'test_auc': 'Test/Epoch_AUC',
-        'test_f1': 'Test/Epoch_F1',
-        'test_loss': 'Test/Epoch_Loss',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
+        'best_criterion': 'Val/Epoch_AUC',
+        'best_direction': 'max',
+    },
+    # 0913-2134: same wrapper as 'egcn' (the smoothed run only changes label_smoothing)
+    'egcn-smooth': {
+        'train_loss': 'Train/Epoch_BCE',
+        'train_loss2': 'Train/Epoch_Margin',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
         'best_criterion': 'Val/Epoch_AUC',
         'best_direction': 'max',
     },
     'gatgru': {
         'train_loss': 'Train/Epoch_BCE',
         'train_loss2': 'Train/Epoch_Margin',
-        'test_auc': 'Test/Epoch_AUC',
-        'test_f1': 'Test/Epoch_F1',
-        'test_loss': 'Test/Epoch_Loss',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
+        'best_criterion': 'Val/Epoch_AUC',
+        'best_direction': 'max',
+    },
+    # 0913-0911: same wrapper as 'gatgru' (the 2-layer run only overrides num_rnn_layers)
+    'gatgru2layer': {
+        'train_loss': 'Train/Epoch_BCE',
+        'train_loss2': 'Train/Epoch_Margin',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
+        'best_criterion': 'Val/Epoch_AUC',
+        'best_direction': 'max',
+    },
+    # 0913-1951: same wrapper again (label_smoothing changes the loss, not the logged tags)
+    'gatgru2layer-smooth': {
+        'train_loss': 'Train/Epoch_BCE',
+        'train_loss2': 'Train/Epoch_Margin',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
         'best_criterion': 'Val/Epoch_AUC',
         'best_direction': 'max',
     },
     'tna': {
         'train_loss': 'Train/Epoch_BCE',
         'train_loss2': 'Train/Epoch_Margin',
-        'test_auc': 'Test/Epoch_AUC',
-        'test_f1': 'Test/Epoch_F1',
-        'test_loss': 'Test/Epoch_Loss',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
+        'best_criterion': 'Val/Epoch_AUC',
+        'best_direction': 'max',
+    },
+    # FiLM fusion variants log exactly the same tags as GAT-GRU (shared trainer_common protocol)
+    'fusion1layer': {
+        'train_loss': 'Train/Epoch_BCE',
+        'train_loss2': 'Train/Epoch_Margin',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
+        'best_criterion': 'Val/Epoch_AUC',
+        'best_direction': 'max',
+    },
+    'fusion2layer': {
+        'train_loss': 'Train/Epoch_BCE',
+        'train_loss2': 'Train/Epoch_Margin',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
         'best_criterion': 'Val/Epoch_AUC',
         'best_direction': 'max',
     },
@@ -127,9 +266,8 @@ MODEL_METRIC_TAGS = {
     'seal': {
         'train_loss': 'Train/Epoch_BCE',
         'train_loss2': None,
-        'test_auc': 'Test/Epoch_AUC',
-        'test_f1': 'Test/Epoch_F1',
-        'test_loss': 'Test/Epoch_Loss',
+        'val_auc': 'Val/Epoch_AUC',
+        'val_f1': 'Val/Epoch_F1',
         'best_criterion': 'Val/Epoch_AUC',  # fallback: Test/Epoch_AUC (runs without a val split)
         'best_direction': 'max',
     },
@@ -137,9 +275,8 @@ MODEL_METRIC_TAGS = {
 
 METRIC_DISPLAY = {
     'train_loss': 'Train Loss',
-    'test_auc': 'AUC',
-    'test_f1': 'F1',
-    'test_loss': 'Test/Val Loss',
+    'val_auc': 'Validation AUC',
+    'val_f1': 'Validation F1',
 }
 
 # When the same model+flag has multiple runs: 'longest' keeps only the run with the most epochs,
@@ -151,6 +288,11 @@ MULTI_RUN_MODE = os.environ.get('IMPUT_MULTI_RUN', 'longest')
 if MULTI_RUN_MODE not in ('longest', 'confidence'):
     print(f"  [WARN] unknown IMPUT_MULTI_RUN={MULTI_RUN_MODE!r}, falling back to 'longest'")
     MULTI_RUN_MODE = 'longest'
+
+# Every epoch-axis figure draws at most this many epochs (2026-09-13): the curves keep the full run
+# behind them, but the x-window stops here so the early-phase dynamics stay legible. x-axes that
+# carry a STEP count (SEAL) are not affected — they are steps, not training epochs.
+EPOCH_AXIS_MAX = 20
 
 
 def _filter_multi_run(df, mode='longest'):
@@ -650,13 +792,79 @@ def get_model_colors():
     return colors
 
 
+# --------------------------------------------------------------- selected-epoch markers
+# The epoch whose numbers get reported is chosen on the validation split, so every validation curve
+# of a SINGLE-RUN figure is starred at the epoch the selection landed on: a reader sees both where
+# the curve peaks and which point the table comes from. The star lies exactly on the drawn curve.
+# Seed-ensemble figures (one curve = mean ± std over several runs) must NOT be starred: every run
+# selected its own epoch, so a lone star at their mean claims a selection nobody made.
+SELECT_MARKER = dict(marker='*', markersize=13, markeredgecolor='black', markeredgewidth=0.5,
+                     linestyle='none', zorder=6)
+SELECT_MARKER_LEGEND = 'selected epoch (Val AUC)'
+SELECT_MARKER_NOTE = '\u2605 = epoch selected on the validation split (Val AUC)'
+
+
+def _selection_tag(df, model):
+    """Tag that selects the epoch for `model`.
+
+    Same legacy fallback as get_best_epoch_metrics(): runs produced before the validation split
+    became the selection split have no Val/Epoch_AUC curve and are selected on the test AUC.
+    """
+    crit = MODEL_METRIC_TAGS.get(model, {}).get('best_criterion', 'Val/Epoch_AUC')
+    if not df[(df['model'] == model) & (df['tag'] == crit)].empty:
+        return crit
+    for fallback in ('Test/Epoch_AUC', 'Val/Epoch_F1', 'Test/Epoch_F1'):
+        if not df[(df['model'] == model) & (df['tag'] == fallback)].empty:
+            return fallback
+    return crit
+
+
+def get_selected_epochs(df):
+    """{(model, flag): [epoch, ...]} — the selected epoch of every run of that cell.
+
+    Selection is per run (each seed picks its own epoch on the validation AUC), so a seed ensemble
+    contributes one epoch per seed and the star ends up at their mean. That mean is NOT the epoch the
+    summary table reports from (the table averages each run's own best value, not the value at the
+    mean epoch), and the per-seed choices can be far apart (measured on the four-seed ensemble: TNA
+    5/9/11/17, EGCN-H 0/2/6/10), so callers must not star a curve that pools several runs. Retained
+    as `best_epoch` per run in seed_ci_per_run.csv.
+    """
+    selected = {}
+    for model in df['model'].unique():
+        tag = _selection_tag(df, model)
+        sub = df[(df['model'] == model) & (df['tag'] == tag)]
+        if sub.empty:
+            continue
+        for (flag, _run_id), group in sub.groupby(['flag', 'run_id']):
+            selected.setdefault((model, flag), []).append(
+                int(group.loc[group['value'].idxmax(), 'epoch']))
+    return selected
+
+
+def mark_selected_point(ax, agg, color, epochs):
+    """Star the selected epoch on an already drawn SINGLE-RUN curve; snapped onto the nearest sample.
+
+    `epochs` holds one selected epoch per run; passing the list of a seed ensemble collapses several
+    different selections into their mean, so seed-ensemble curves must skip this call.
+    """
+    if ax is None or agg is None or agg.empty or not epochs:
+        return None
+    target = float(np.mean(epochs))
+    nearest = int(np.argmin(np.abs(agg['epoch'].to_numpy(dtype=float) - target)))
+    return ax.plot([float(agg['epoch'].iloc[nearest])], [float(agg['mean'].iloc[nearest])],
+                   color=color, **SELECT_MARKER)
+
+
 def plot_epoch_lines(df, tag_patterns, title, filename, ylabel, group_by='model',
-                     ncols=2, figsize=None):
+                     ncols=2, figsize=None, mark_selected=False):
     """
     Generic epoch line plot (SEAL uses dual x-axes: Epoch at bottom, Step at top).
     tag_patterns: [(tag_regex, sub_title), ...]
+    mark_selected: star the epoch chosen on the validation split on every curve of this figure —
+                   set it for validation-split curves, leave it off for training-loss curves.
     """
     colors = get_model_colors()
+    selected = get_selected_epochs(df) if mark_selected else {}
     n_plots = len(tag_patterns)
     if figsize is None:
         figsize = (7 * ncols, 5 * ((n_plots + ncols - 1) // ncols))
@@ -694,11 +902,13 @@ def plot_epoch_lines(df, tag_patterns, title, filename, ylabel, group_by='model'
                 if model == 'seal':
                     max_step = max(max_step, agg['epoch'].max())
                     seal_lines.append((agg, color, label))
+                    mark_selected_point(ax_step, agg, color, selected.get((model, flag)))
                 else:
-                    agg_ep = agg[agg['epoch'] <= 20]
+                    agg_ep = agg[agg['epoch'] <= EPOCH_AXIS_MAX]
                     if not agg_ep.empty:
                         max_epoch = max(max_epoch, agg_ep['epoch'].max())
                     epoch_lines.append((agg, color, label))
+                    mark_selected_point(ax_epoch, agg, color, selected.get((model, flag)))
 
         if max_epoch > 0:
             ax_epoch.set_xlim(0, max_epoch)
@@ -739,7 +949,12 @@ def plot_epoch_lines(df, tag_patterns, title, filename, ylabel, group_by='model'
 
         handles1, labels1 = ax_epoch.get_legend_handles_labels()
         handles2, labels2 = ax_step.get_legend_handles_labels() if ax_step else ([], [])
-        ax.legend(handles1 + handles2, labels1 + labels2, fontsize=8, loc='best', ncol=2)
+        handles_all, labels_all = handles1 + handles2, labels1 + labels2
+        if mark_selected and handles_all:
+            handles_all = handles_all + [Line2D([0], [0], color='black', marker='*',
+                                                markersize=10, linestyle='none')]
+            labels_all = labels_all + [SELECT_MARKER_LEGEND]
+        ax.legend(handles_all, labels_all, fontsize=8, loc='best', ncol=2)
 
     for idx in range(n_plots, axes.size):
         axes[idx // ncols][idx % ncols].set_visible(False)
@@ -752,7 +967,7 @@ def plot_epoch_lines(df, tag_patterns, title, filename, ylabel, group_by='model'
 
 
 def plot_training_loss(df):
-    """Training loss line plot"""
+    """Training-side loss line plot — the train split is the only split any loss curve uses."""
     tag_patterns = [
         ('Train/Epoch_BCE', 'BCE Loss'),
         ('Train/Epoch_Margin', 'Margin Ranking Loss'),
@@ -766,19 +981,23 @@ def plot_training_loss(df):
     )
 
 
-def plot_test_metrics(df):
-    """Test-set metric line plot"""
+def plot_validation_metrics(df):
+    """Validation-split line plot: the AUC/F1 that select the epoch, with the selected point starred.
+
+    The test split has no curve on purpose — it is reported as one number per cell in the summary
+    table, so no line figure compares curves coming from different splits.
+    """
     tag_patterns = [
-        ('Test/Epoch_Loss', 'BCE Loss'),
-        ('Test/Epoch_AUC', 'AUC'),
-        ('Test/Epoch_F1', 'F1 Score'),
+        ('Val/Epoch_AUC', 'Validation AUC'),
+        ('Val/Epoch_F1', 'Validation F1'),
     ]
     plot_epoch_lines(
         df, tag_patterns,
-        title='Test Set Metrics by Epoch',
-        filename=str(OUTPUT_DIR / 'test_metrics.png'),
+        title='Validation Set Metrics by Epoch',
+        filename=str(OUTPUT_DIR / 'validation_metrics.png'),
         ylabel='Value',
-        ncols=3,
+        ncols=2,
+        mark_selected=True,
     )
 
 
@@ -817,7 +1036,7 @@ def _plot_monitor_internal(df):
                 max_step = max(max_step, agg['epoch'].max())
                 seal_lines_fq.append((agg, color, label))
             else:
-                agg_ep = agg[agg['epoch'] <= 20]
+                agg_ep = agg[agg['epoch'] <= EPOCH_AXIS_MAX]
                 if not agg_ep.empty:
                     max_epoch = max(max_epoch, agg_ep['epoch'].max())
                 epoch_lines_fq.append((agg, color, label))
@@ -886,7 +1105,7 @@ def _plot_monitor_internal(df):
                     max_step = max(max_step, agg['epoch'].max())
                     seal_lines.append((agg, color, label))
                 else:
-                    agg_ep = agg[agg['epoch'] <= 40]
+                    agg_ep = agg[agg['epoch'] <= EPOCH_AXIS_MAX]
                     if not agg_ep.empty:
                         max_epoch = max(max_epoch, agg_ep['epoch'].max())
                     epoch_lines.append((agg, color, label))
@@ -959,29 +1178,33 @@ def _build_unified_legend(fig, df):
 
 def plot_combined_test_monitor(df):
     """
-    Merge test_metrics and monitor_metrics into a 3x2 panel figure.
+    Merge the training-loss panel with the validation-split metric panels into a 3x2 figure.
+    Loss curves come from the train split; every other panel is drawn from the validation split
+    (Monitor/*), i.e. the split that selects the epoch, and stars the selected point. The test split
+    deliberately has no curve here — it is reported as one number per cell in the summary table.
     SEAL data is recorded per batch step and drawn on the top x-axis (dashed);
     the other models are drawn per epoch on the bottom x-axis (solid).
     A unified legend is arranged 4x5 at the outer bottom; each subplot no longer draws its own legend.
     The x-axis names (Epoch / Step) are placed on the right to avoid clashing with subplot titles.
     """
     colors = get_model_colors()
+    selected = get_selected_epochs(df)
     seal_present = 'seal' in df['model'].unique()
 
-    # 6 panels: (tag, title, epoch_limit_for_non_seal)
+    # 6 panels: (tag, title, epoch_limit_for_non_seal, mark_selected)
     panels = [
-        ('Test/Epoch_Loss',             'Test BCE Loss',               20),
-        ('Test/Epoch_AUC',              'Test AUC',                    20),
-        ('Test/Epoch_F1',               'Test F1 Score',               20),
-        ('Monitor/Factset_Quantile',    'Factset Quantile',            20),
-        ('Monitor/Wasserstein_Diff',            'Wasserstein Diff (Neg\u2212Pos)',  40),
-        ('Monitor/Wasserstein_Factset_vs_Neg',  'Wasserstein(Factset, Neg)',        40),
+        ('Train/Epoch_BCE',                     'Train BCE Loss',                       EPOCH_AXIS_MAX, False),
+        ('Val/Epoch_AUC',                       'Validation AUC',                       EPOCH_AXIS_MAX, True),
+        ('Val/Epoch_F1',                        'Validation F1 Score',                  EPOCH_AXIS_MAX, True),
+        ('Monitor/Factset_Quantile',            'Validation Factset Quantile',          EPOCH_AXIS_MAX, True),
+        ('Monitor/Wasserstein_Diff',            'Validation Wasserstein Diff (Neg\u2212Pos)', EPOCH_AXIS_MAX, True),
+        ('Monitor/Wasserstein_Factset_vs_Neg',  'Validation Wasserstein(Factset, Neg)', EPOCH_AXIS_MAX, True),
     ]
 
     fig, axes = plt.subplots(3, 2, figsize=(18, 15))
-    fig.suptitle('Test Metrics & Monitor Metrics', fontsize=20, fontweight='bold', y=0.99)
+    fig.suptitle('Training Loss & Validation Metrics', fontsize=20, fontweight='bold', y=0.99)
 
-    for idx, (tag, title, epoch_limit) in enumerate(panels):
+    for idx, (tag, title, epoch_limit, mark) in enumerate(panels):
         row, col = idx // 2, idx % 2
         ax = axes[row][col]
         ax_epoch = ax
@@ -1009,11 +1232,15 @@ def plot_combined_test_monitor(df):
                 if model == 'seal':
                     max_step = max(max_step, agg['epoch'].max())
                     seal_lines.append((agg, color, label))
+                    if mark:
+                        mark_selected_point(ax_step, agg, color, selected.get((model, flag)))
                 else:
                     agg_ep = agg[agg['epoch'] <= epoch_limit]
                     if not agg_ep.empty:
                         max_epoch = max(max_epoch, agg_ep['epoch'].max())
                     epoch_lines.append((agg, color, label))
+                    if mark:
+                        mark_selected_point(ax_epoch, agg, color, selected.get((model, flag)))
 
         if max_epoch > 0:
             ax_epoch.set_xlim(0, max_epoch)
@@ -1054,8 +1281,9 @@ def plot_combined_test_monitor(df):
         ax.grid(True, alpha=0.3)
 
     _build_unified_legend(fig, df)
+    fig.text(0.5, 0.068, SELECT_MARKER_NOTE, ha='center', fontsize=9, color='#555555')
 
-    plt.tight_layout(rect=[0, 0.10, 1, 0.97])
+    plt.tight_layout(rect=[0, 0.11, 1, 0.97])
     fname = OUTPUT_DIR / 'test_monitor_combined.png'
     plt.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close()
@@ -1063,15 +1291,20 @@ def plot_combined_test_monitor(df):
 
 
 def plot_per_model_comparison(df):
-    """One figure per model, comparing training loss and Test AUC across the 4 parameter configs"""
+    """One figure per model: training loss (train split) plus the validation AUC/F1 curves.
+
+    The validation curves star the epoch the selection landed on, so the reported point is visible
+    next to the four negative-sampling configs of §5.2.
+    """
     colors = get_model_colors()
+    selected = get_selected_epochs(df)
 
     for model in sorted(df['model'].unique()):
         mt = MODEL_METRIC_TAGS.get(model, MODEL_METRIC_TAGS['bigru'])
         tag_list = [
             (mt.get('train_loss', 'Train/Epoch_BCE'), METRIC_DISPLAY['train_loss']),
-            (mt.get('test_auc', 'Test/Epoch_AUC'), METRIC_DISPLAY['test_auc']),
-            (mt.get('test_f1', 'Test/Epoch_F1'), METRIC_DISPLAY['test_f1']),
+            (mt.get('val_auc', 'Val/Epoch_AUC'), METRIC_DISPLAY['val_auc']),
+            (mt.get('val_f1', 'Val/Epoch_F1'), METRIC_DISPLAY['val_f1']),
         ]
         valid_tags = [(t, d) for t, d in tag_list
                       if t and not df[(df['model'] == model) & (df['tag'] == t)].empty]
@@ -1100,7 +1333,8 @@ def plot_per_model_comparison(df):
         if model == 'seal':
             xlim_right = model_max_epoch if model_max_epoch > 0 else 1000
         else:
-            xlim_right = min(model_max_epoch, 20) if model_max_epoch > 0 else 20
+            xlim_right = (min(model_max_epoch, EPOCH_AXIS_MAX) if model_max_epoch > 0
+                          else EPOCH_AXIS_MAX)
 
         for idx, (tag, title) in enumerate(valid_tags):
             ax = axes[idx // ncols][idx % ncols]
@@ -1121,6 +1355,9 @@ def plot_per_model_comparison(df):
                                     agg['mean'] - agg['std'],
                                     agg['mean'] + agg['std'],
                                     color=color, alpha=0.12)
+                # Only the validation panels have a selected point to show; the loss panel is train.
+                if tag.startswith(('Val/', 'Monitor/')):
+                    mark_selected_point(ax, agg, color, selected.get((model, flag)))
             ax.set_title(title, fontsize=12)
             ax.set_xlabel('Epoch')
             ax.set_xlim(left=0, right=xlim_right)
@@ -1132,19 +1369,107 @@ def plot_per_model_comparison(df):
         for idx in range(n_plots, axes.size):
             axes[idx // ncols][idx % ncols].set_visible(False)
 
-        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        if any(t.startswith(('Val/', 'Monitor/')) for t, _ in valid_tags):
+            fig.text(0.5, 0.025, SELECT_MARKER_NOTE, ha='center', fontsize=9, color='#555555')
+
+        plt.tight_layout(rect=[0, 0.065, 1, 0.93])
         fname = OUTPUT_DIR / f'per_model_{model}.png'
         plt.savefig(fname, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Saved: {fname}")
 
 
-def plot_summary_table(best_df, epoch_df, err_df=None, err_label='95% CI'):
+# Two-sided 95% t critical values by sample size; anything larger is close enough to the normal 1.96.
+_T95 = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571}
+
+
+def _ci95_of_mean(vals):
+    """Half-width of the two-sided 95% CI of the mean (small-sample t), same convention as
+    Analysis/seed_ci_figures.py, so the thresholds carry the same error bar as the metrics."""
+    arr = np.asarray([v for v in vals if v is not None and np.isfinite(float(v))], dtype=float)
+    if arr.size < 2:
+        return np.nan
+    t = _T95.get(int(arr.size), 1.96)
+    return float(t * arr.std(ddof=1) / np.sqrt(arr.size))
+
+
+def load_threshold_table(csv_path=None):
+    """Operating-point thresholds per (model, flag): [model, flag, youden_thr, f1_thr, *_ci].
+
+    Values are the mean over seeds of the Youden's-J threshold and of the F1-max threshold of the
+    best checkpoint, i.e. exactly the numbers in Analysis/npy_roc_output_ci/roc_ci_summary.md; the
+    `*_ci` columns are the 95% CI half-width of that mean over the seeds (same t convention as the
+    metric columns), and stay NaN when only one seed is available.
+    Returns None when no source is available, in which case the summary table simply omits the two
+    columns (a results tree without saved score arrays keeps the old layout).
+    """
+    import json as _json
+    csv_candidates = [Path(csv_path)] if csv_path else list(THR_CSV_CANDIDATES)
+    for path in csv_candidates:
+        try:
+            if not Path(path).is_file():
+                continue
+            raw = pd.read_csv(path)
+            needed = {'model', 'flag', 'youden_threshold_mean', 'f1_threshold_mean'}
+            if not needed.issubset(raw.columns):
+                continue
+            has_ci = {'youden_threshold_ci95', 'f1_threshold_ci95'}.issubset(raw.columns)
+            cols = ['model', 'flag', 'youden_threshold_mean', 'f1_threshold_mean']
+            if has_ci:
+                cols += ['youden_threshold_ci95', 'f1_threshold_ci95']
+            out = raw[cols].copy()
+            if has_ci:
+                out.columns = ['model', 'flag', 'youden_thr', 'f1_thr', 'youden_ci', 'f1_ci']
+            else:
+                out.columns = ['model', 'flag', 'youden_thr', 'f1_thr']
+                out['youden_ci'] = np.nan      # older csv: thresholds without an across-seed spread
+                out['f1_ci'] = np.nan
+            print(f"  Threshold source: {Path(path).name} ({len(out)} rows"
+                  f"{', with 95% CI' if has_ci else ', no CI columns'})")
+            return out
+        except (OSError, ValueError) as exc:  # unreadable / truncated csv -> fall through
+            print(f"  [WARN] could not read {path}: {exc}")
+
+    # Fallback: average the per-run JSONs. Directory layout is <model>/<...>-<flag>[-s<seed>]/.
+    per_key = {}
+    for jpath in sorted(RESULTS_DIR.glob('**/model_predictions_best_thresholds.json')):
+        run_dir = jpath.parent
+        flag = next((f for f in DIFFICULTY_ORDER if f in run_dir.name), None)
+        if flag is None:
+            continue
+        try:
+            rec = _json.loads(jpath.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        youden, f1max = rec.get('youden_j'), rec.get('f1_max')
+        if youden is None and f1max is None:
+            continue
+        per_key.setdefault((run_dir.parent.name, flag), []).append((youden, f1max))
+    if not per_key:
+        print("  [WARN] no operating-point thresholds found; the summary table omits those columns")
+        return None
+    rows = [{'model': m, 'flag': f,
+             'youden_thr': float(np.nanmean([v[0] for v in vals])),
+             'f1_thr': float(np.nanmean([v[1] for v in vals])),
+             'youden_ci': _ci95_of_mean([v[0] for v in vals]),
+             'f1_ci': _ci95_of_mean([v[1] for v in vals])}
+            for (m, f), vals in per_key.items()]
+    print(f"  Threshold source: per-run JSONs under {RESULTS_DIR.name} ({len(rows)} rows)")
+    return pd.DataFrame(rows)
+
+
+def plot_summary_table(best_df, epoch_df, err_df=None, err_label='95% CI', thr_df=None):
     """Create a colored summary table figure (including Wasserstein_Diff and mean epoch duration)
 
     err_df: optional seed aggregate from aggregate_best_metrics(). When given, the values in best_df
     are means over the repeats and every metric cell is annotated with its across-seed uncertainty
     (half-width of the err_label interval), with the number of runs stated in the title.
+
+    thr_df: optional operating-point thresholds from load_threshold_table(). Adds two columns
+    (Youden's-J threshold, F1-max threshold) written as mean ± 95% CI over the seeds, coloured by
+    the distance |t - 0.5| (green = the operating point sits near the default 0.5 cut, red = it has
+    drifted to an extreme). That distance is a calibration statement, not a goodness measure, so
+    the column must not be read as "redder is worse".
     """
     # Monitor/* now describes the validation split that drives early stopping, while the table
     # reports the held-out test split. Newer runs therefore log the test-split FactSet statistics
@@ -1198,71 +1523,112 @@ def plot_summary_table(best_df, epoch_df, err_df=None, err_label='95% CI'):
     if not row_keys:
         return
 
-    table_data = []
-    row_labels = []
+    # Operating-point thresholds (one value per (model, flag)). Kept as a separate lookup because
+    # they do not come from TensorBoard at all.
+    # (youden, f1, youden_ci, f1_ci); the CIs are NaN when the source has a single seed, in which
+    # case the cell shows the bare value with no ± line.
+    thr_map = {}
+    if thr_df is not None and not thr_df.empty:
+        for _, row in thr_df.iterrows():
+            thr_map[(row['model'], row['flag'])] = (
+                row['youden_thr'], row['f1_thr'],
+                row.get('youden_ci', np.nan), row.get('f1_ci', np.nan))
+    has_thr = any((m, f) in thr_map for m, f in row_keys)
+
     has_time = len(time_per_key) > 0
-
-    for model, flag in row_keys:
-        row = []
-        for tag in available_tags:
-            val = best_df[(best_df['model'] == model) &
-                          (best_df['flag'] == flag) &
-                          (best_df['tag'] == tag)]['value']
-            row.append(val.iloc[0] if len(val) > 0 else np.nan)
-        if has_time:
-            row.append(time_per_key.get((model, flag), np.nan))
-        table_data.append(row)
-        row_labels.append(f"{MODEL_DISPLAY.get(model, model)} [{flag}]")
-
-    data_arr = np.array(table_data)
     col_labels = [t.split('/')[-1] for t in available_tags]
+    # Deliberately single-line labels so best_metrics_table.csv keeps flat column names.
+    if has_thr:
+        col_labels += ['Youden Thr', 'F1* Thr']
     if has_time:
         col_labels.append('Avg\nTime/Epoch (s)')
+    n_cols = len(col_labels)
+    n_metric_cols = len(available_tags)
+    # Threshold columns sit between the metrics and the duration column. They are NOT part of the
+    # per-column min-max heatmap: they get their own absolute scale (distance from the 0.5 default
+    # cut) so the colour loop below must not see them.
+    thr_col_idx = list(range(n_metric_cols, n_metric_cols + 2)) if has_thr else []
 
-    n_rows, n_cols = data_arr.shape
-    fig, ax = plt.subplots(figsize=(3.6 * n_cols, 0.5 * n_rows + 2.0))
-    ax.axis('off')
+    # One block per negative-sampling regime, drawn side by side. Each block is coloured on its own
+    # scale: pooling the regimes would let the easier one (higher AUC, lower loss) compress the
+    # contrast inside the harder one, which is the comparison the table is read for.
+    blocks = []
+    for flag in sorted({f for _m, f in row_keys}, key=lambda f: DIFFICULTY_ORDER.get(f, 9)):
+        keys = [(m, f) for (m, f) in row_keys if f == flag]
+        block_rows, block_labels = [], []
+        for model, fl in keys:
+            row = []
+            for tag in available_tags:
+                val = best_df[(best_df['model'] == model) &
+                              (best_df['flag'] == fl) &
+                              (best_df['tag'] == tag)]['value']
+                row.append(val.iloc[0] if len(val) > 0 else np.nan)
+            if has_thr:
+                youden_thr, f1_thr = thr_map.get((model, fl), (np.nan, np.nan, np.nan, np.nan))[:2]
+                row.append(youden_thr)
+                row.append(f1_thr)
+            if has_time:
+                row.append(time_per_key.get((model, fl), np.nan))
+            block_rows.append(row)
+            block_labels.append(MODEL_DISPLAY.get(model, model))
+        blocks.append({'flag': flag, 'keys': keys, 'data': np.array(block_rows),
+                       'labels': block_labels})
+
     title = 'Best Epoch Metrics Summary'
     if err_map:
         title += f' (mean ± {err_label} over {n_runs} runs)'
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
 
-    # Normalize each metric column for coloring (the duration column is handled separately)
-    cell_colors = np.zeros((n_rows, n_cols, 3))
-    n_metric_cols = len(available_tags)  # excludes the duration column
-    for c in range(n_metric_cols):
-        col_vals = data_arr[:, c]
-        valid = ~np.isnan(col_vals)
-        if valid.sum() > 0:
-            vmin, vmax = np.nanmin(col_vals), np.nanmax(col_vals)
-            if vmax > vmin:
-                norm_vals = (col_vals - vmin) / (vmax - vmin)
-            else:
-                norm_vals = np.full_like(col_vals, 0.5)
-            if 'Loss' in col_labels[c] or 'BCE' in col_labels[c]:
-                cmap = plt.get_cmap('RdYlGn_r')
-            else:
-                cmap = plt.get_cmap('RdYlGn')
-            for r in range(n_rows):
-                if not np.isnan(col_vals[r]):
-                    cell_colors[r, c] = cmap(norm_vals[r])[:3]
+    def _block_colors(data_arr):
+        """Colour one block: every column is rescaled on this block's own min-max."""
+        cell_colors = np.zeros((data_arr.shape[0], n_cols, 3))
+        for c in range(n_metric_cols):
+            col_vals = data_arr[:, c]
+            valid = ~np.isnan(col_vals)
+            if valid.sum() > 0:
+                vmin, vmax = np.nanmin(col_vals), np.nanmax(col_vals)
+                if vmax > vmin:
+                    norm_vals = (col_vals - vmin) / (vmax - vmin)
+                else:
+                    norm_vals = np.full_like(col_vals, 0.5)
+                if 'Loss' in col_labels[c] or 'BCE' in col_labels[c]:
+                    cmap = plt.get_cmap('RdYlGn_r')
+                else:
+                    cmap = plt.get_cmap('RdYlGn')
+                for r in range(data_arr.shape[0]):
+                    if not np.isnan(col_vals[r]):
+                        cell_colors[r, c] = cmap(norm_vals[r])[:3]
 
-    # Duration column handled separately, no heatmap normalization
-    if has_time:
-        time_col = n_cols - 1
-        time_vals = data_arr[:, time_col]
-        valid_t = ~np.isnan(time_vals)
-        if valid_t.sum() > 0:
-            vmin_t, vmax_t = np.nanmin(time_vals), np.nanmax(time_vals)
-            time_cmap = plt.get_cmap('RdYlGn_r')  # shorter is better
-            for r in range(n_rows):
-                if not np.isnan(time_vals[r]):
-                    norm_t = (time_vals[r] - vmin_t) / max(vmax_t - vmin_t, 1e-6)
-                    cell_colors[r, time_col] = time_cmap(norm_t)[:3]
+        # Duration column handled separately, no heatmap normalization
+        if has_time:
+            time_col = n_cols - 1
+            time_vals = data_arr[:, time_col]
+            valid_t = ~np.isnan(time_vals)
+            if valid_t.sum() > 0:
+                vmin_t, vmax_t = np.nanmin(time_vals), np.nanmax(time_vals)
+                time_cmap = plt.get_cmap('RdYlGn_r')  # shorter is better
+                for r in range(data_arr.shape[0]):
+                    if not np.isnan(time_vals[r]):
+                        norm_t = (time_vals[r] - vmin_t) / max(vmax_t - vmin_t, 1e-6)
+                        cell_colors[r, time_col] = time_cmap(norm_t)[:3]
 
-    def _fmt_val(v, is_time=False):
+        # Threshold columns: absolute scale, green at the default 0.5 cut and red at the ends of
+        # the score range (t -> 0 or t -> 1), i.e. the colour reads as "how far the operating point
+        # has drifted from 0.5", never as "higher = better". Fixed scale (not per-block min-max) so
+        # the two panels stay comparable.
+        thr_cmap = plt.get_cmap('RdYlGn_r')          # 0 -> green, 1 -> red
+        for c in thr_col_idx:
+            for r in range(data_arr.shape[0]):
+                if np.isnan(data_arr[r, c]):
+                    continue
+                dist = min(abs(data_arr[r, c] - 0.5) / 0.5, 1.0)
+                cell_colors[r, c] = thr_cmap(dist)[:3]
+        return cell_colors
+
+    def _fmt_val(v, is_time=False, is_thr=False):
         if np.isnan(v):
             return '-'
+        if is_thr:
+            return f'{v:.3f}'
         if is_time:
             if v >= 3600:
                 return f'{v/3600:.1f}h'
@@ -1277,54 +1643,134 @@ def plot_summary_table(best_df, epoch_df, err_df=None, err_label='95% CI'):
         else:
             return f'{v:.3f}'
 
-    cell_text = []
-    for r in range(n_rows):
-        model, flag = row_keys[r]
-        row_text = []
-        for c in range(n_cols):
-            is_time = has_time and c == n_cols - 1
-            text = _fmt_val(data_arr[r, c], is_time=is_time)
-            if not is_time and c < n_metric_cols:
-                err = err_map.get((model, flag, available_tags[c]))
-                if err is not None:
+    for b in blocks:
+        b['colors'] = _block_colors(b['data'])
+        cell_text = []
+        for r, (model, flag) in enumerate(b['keys']):
+            row_text = []
+            for c in range(n_cols):
+                is_time = has_time and c == n_cols - 1
+                is_thr = c in thr_col_idx
+                text = _fmt_val(b['data'][r, c], is_time=is_time, is_thr=is_thr)
+                if is_thr:
+                    # Same error bar as the metric columns: the thresholds are per-seed numbers too,
+                    # so the mean comes with its own across-seed 95% CI (NaN -> no ± line).
+                    thr_vals = thr_map.get((model, flag))
+                    err = thr_vals[2 + thr_col_idx.index(c)] if thr_vals else np.nan
+                elif is_time:
+                    err = np.nan
+                else:
+                    err = err_map.get((model, flag, available_tags[c]))
+                if err is not None and np.isfinite(float(err)):
                     text += f"\n\u00b1{err:.3f}"
-            row_text.append(text)
-        cell_text.append(row_text)
+                row_text.append(text)
+            cell_text.append(row_text)
+        b['cell_text'] = cell_text
 
-    table = ax.table(cellText=cell_text, rowLabels=row_labels, colLabels=col_labels,
-                     cellColours=cell_colors, cellLoc='center', loc='center',
-                     colColours=[(0.95, 0.95, 0.95)] * n_cols)
+    # Table geometry from the content. ax.table stretches the columns to the full axes width
+    # (colWidths defaults to 1/ncols), so a figure sized as a fixed "3.6 in per column" left most
+    # of every cell empty. Measure the widest rendered line of each column and the tallest cell of
+    # each row, then size the figure so the cells hug their text with a constant padding.
+    TABLE_FONTSIZE = 9
+    PAD_X, PAD_Y = 0.14, 0.07          # inches on each side of the text
+    LINE_FACTOR = 1.35                 # line height, in units of the font size
+    probe = plt.figure(dpi=100)
+    probe_renderer = probe.canvas.get_renderer()
+    probe_font = fm.FontProperties(size=TABLE_FONTSIZE)
 
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.2, 1.6)
+    def _text_in(text):
+        return max(probe_renderer.get_text_width_height_descent(line, probe_font, False)[0]
+                   for line in str(text).split('\n')) / probe.dpi
 
-    # Row label color
-    for (r, c), cell in table.get_celld().items():
-        if c == -1 and r > 0:
-            data_idx = r - 1
-            if data_idx < len(row_labels):
-                label = row_labels[data_idx]
-                for model_key, display_name in MODEL_DISPLAY.items():
-                    if display_name in label:
-                        cmap = plt.get_cmap(MODEL_BASE_COLORS[model_key])
-                        flag_label = label.split('[')[1].rstrip(']')
-                        shade = SHADE_POSITIONS[DIFFICULTY_ORDER.get(flag_label, 3)]
-                        cell.set_facecolor(cmap(shade))
-                        cell.set_text_props(color='white', fontweight='bold')
-                        break
+    def _lines(text):
+        return len(str(text).split('\n'))
 
-    plt.tight_layout()
+    all_cells = [row for b in blocks for row in b['cell_text']]
+    col_in = [max([_text_in(col_labels[c])] + [_text_in(row[c]) for row in all_cells])
+              + 2 * PAD_X for c in range(n_cols)]
+    label_in = max(_text_in(label) for b in blocks for label in b['labels']) + 2 * PAD_X
+    # Both blocks share one geometry so they line up row by row: the header height, then for every
+    # row index the tallest cell any block puts there.
+    row_in = [max(_lines(label) for label in col_labels) * TABLE_FONTSIZE / 72 * LINE_FACTOR
+              + 2 * PAD_Y]
+    n_data_rows = max(len(b['cell_text']) for b in blocks)
+    for i in range(n_data_rows):
+        tallest = max([max(_lines(value) for value in b['cell_text'][i])
+                       for b in blocks if i < len(b['cell_text'])] or [1])
+        row_in.append(tallest * TABLE_FONTSIZE / 72 * LINE_FACTOR + 2 * PAD_Y)
+    plt.close(probe)
+
+    axes_w, axes_h = sum(col_in) + label_in, sum(row_in)
+    n_blocks = len(blocks)
+    gap_in, margin_in = 0.60, 0.15                      # inches between the blocks / at the sides
+    fig_w = n_blocks * axes_w + (n_blocks - 1) * gap_in + 2 * margin_in
+    fig_h = axes_h + (1.45 if has_thr else 1.25)        # title band + footnote line(s)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    for i, b in enumerate(blocks):
+        # 0.055, not 0.03: the table has to clear the two footnote lines below it.
+        ax = fig.add_axes([(margin_in + i * (axes_w + gap_in)) / fig_w, 0.055,
+                           axes_w / fig_w, axes_h / fig_h])
+        ax.axis('off')
+        ax.set_title(FLAG_PANEL.get(b['flag'], b['flag']), fontsize=12, fontweight='bold', pad=12)
+
+        table = ax.table(cellText=b['cell_text'], rowLabels=b['labels'], colLabels=col_labels,
+                         cellColours=b['colors'], cellLoc='center', loc='center',
+                         colWidths=[width / axes_w for width in col_in],
+                         colColours=[(0.95, 0.95, 0.95)] * n_cols)
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(TABLE_FONTSIZE)
+        # The factory auto-fits the row-label column to the bare text and would overwrite the padded
+        # width set below when the figure is drawn, so it is dropped from the auto list.
+        table._autoColumns = []
+        for r in range(1, len(b['labels']) + 1):
+            table[(r, -1)].set_width(label_in / axes_w)
+        for (r, _c), cell in table.get_celld().items():
+            cell.set_height(row_in[r] / axes_h)
+
+        # Row label color: the model's base colour at the shade of this block's regime
+        shade = SHADE_POSITIONS[DIFFICULTY_ORDER.get(b['flag'], 3)]
+        for r, model_key in enumerate([key[0] for key in b['keys']], start=1):
+            cell = table[(r, -1)]
+            cell.set_facecolor(plt.get_cmap(MODEL_BASE_COLORS.get(model_key, 'Greys'))(shade))
+            cell.set_text_props(color='white', fontweight='bold')
+
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1 - 0.12 / fig_h)
+    fig.text(0.5, 0.036,
+             'Cell colour: red → green, rescaled inside each panel and each metric column '
+             '(the two threshold columns use the absolute scale described below)',
+             fontsize=8, color='0.35', ha='center')
+    if has_thr:
+        fig.text(0.5, 0.012,
+                 'Youden Thr / F1* Thr: seed-mean operating point of the best checkpoint ± its 95% '
+                 'CI over the seeds; colour = distance from the default 0.5 cut '
+                 '(green near 0.5 → red at 0 or 1), i.e. score-scale drift, not a goodness measure. '
+                 'Per-seed values in Analysis/npy_roc_output_ci/roc_ci_summary.csv',
+                 fontsize=8, color='0.35', ha='center')
+
+    # no tight_layout here: the axes were positioned explicitly from the measured table geometry
     fname = OUTPUT_DIR / 'summary_table.png'
     plt.savefig(fname, dpi=200, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {fname}")
 
+    # Same rows as before the split into per-flag blocks: model-major, then regime.
+    flat_rows = {(m, f): (label, row)
+                 for b in blocks
+                 for (m, f), label, row in zip(b['keys'], b['labels'], b['data'])}
     csv_data = []
-    for i, (r_label, r_data) in enumerate(zip(row_labels, table_data)):
-        csv_row = {'Model_Config': r_label}
+    for i, (model, flag) in enumerate(row_keys):
+        r_label, r_data = flat_rows[(model, flag)]
+        csv_row = {'Model_Config': f'{r_label} [{flag}]'}
         for j, col_name in enumerate(col_labels):
             csv_row[col_name] = r_data[j]
+        if has_thr:
+            # The uncertainty of the two operating points, so the CSV carries the error bars the
+            # figure prints under the numbers. Missing when the source had a single seed.
+            tv = thr_map.get((model, flag))
+            if tv is not None:
+                csv_row['Youden Thr CI95'] = tv[2]
+                csv_row['F1* Thr CI95'] = tv[3]
         csv_data.append(csv_row)
     csv_df = pd.DataFrame(csv_data)
     csv_fname = OUTPUT_DIR / 'best_metrics_table.csv'
@@ -1527,13 +1973,19 @@ def plot_score_dist_16panel(hist_data):
     Uniformly resampled to 50 bins, no smoothing, normalized to 5000.
     Outputs two figures: linear y-axis + log y-axis.
     """
-    models_ordered = ['bigru', 'egcn', 'gatgru', 'tna', 'seal']
-    flags_ordered = ['ftt', 'ftf', 'fff', 'tff']
+    # canonical order, restricted to the (model, flag) combinations present in the current logs so
+    # that partial roots (e.g. a seed ensemble with only two flags / extra fusion models) still work
+    present = {(k[0], k[1]) for k in hist_data}
+    models_ordered = [m for m in MODEL_DISPLAY if any(p[0] == m for p in present)]
+    flags_ordered = [f for f in ['ftt', 'ftf', 'fff', 'tff'] if any(p[1] == f for p in present)]
     score_tags = [
         'Score_Distribution/Factset',
         'Score_Distribution/TestSet_Positive',
         'Score_Distribution/TestSet_Negative',
     ]
+    if not models_ordered or not flags_ordered:
+        print("  [SKIP] score distributions: no histogram data found")
+        return
 
     n_rows, n_cols = len(models_ordered), len(flags_ordered)
 
@@ -1551,7 +2003,8 @@ def plot_score_dist_16panel(hist_data):
         return np.sum(np.abs(cdf1 - cdf2)) * bin_width
 
     def _draw_one_figure(log_scale):
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(28, 27), squeeze=False)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(28 * n_cols / 4, 27 * n_rows / 5),
+                                 squeeze=False)
         ylabel = f'Count (normalized to {TARGET_TOTAL}, log scale)' if log_scale \
                  else f'Count (normalized to {TARGET_TOTAL})'
         scale_str = 'Log Y' if log_scale else 'Linear Y'
@@ -1649,8 +2102,9 @@ def plot_wasserstein_scatter(hist_data):
     Colors distinguish models, shapes distinguish parameter configs.
     W(F,N)-W(F,P) = W(F,N) - W(F,P)
     """
-    models_ordered = ['bigru', 'egcn', 'gatgru', 'tna', 'seal']
-    flags_ordered = ['ftt', 'ftf', 'fff', 'tff']
+    present = {(k[0], k[1]) for k in hist_data}
+    models_ordered = [m for m in MODEL_DISPLAY if any(p[0] == m for p in present)]
+    flags_ordered = [f for f in ['ftt', 'ftf', 'fff', 'tff'] if any(p[1] == f for p in present)]
 
     factset_tag = 'Score_Distribution/Factset'
     pos_tag = 'Score_Distribution/TestSet_Positive'
@@ -1777,14 +2231,22 @@ def plot_wasserstein_scatter(hist_data):
 
 def main():
     args = parse_args()
-    global MULTI_RUN_MODE
+    global MULTI_RUN_MODE, MODEL_CONFIG
+    MODEL_CONFIG = args.model_config or MODEL_CONFIG
     MULTI_RUN_MODE = args.multi_run
     if args.seed_ci and MULTI_RUN_MODE != 'confidence':
         print(f"  [INFO] --seed-ci needs every run of a (model, flag): switching multi-run mode "
               f"'{MULTI_RUN_MODE}' -> 'confidence'")
         MULTI_RUN_MODE = 'confidence'
 
+    set_paths(args.results_dir, args.out_dir)
+    if not RESULTS_DIR.is_dir():
+        print(f"  [ERROR] results directory not found: {RESULTS_DIR}")
+        return
+
     print("  Temporal Network Internal Data Imputation — Results Visualization")
+    print(f"  Results root  : {RESULTS_DIR}")
+    print(f"  Output root   : {OUTPUT_DIR}")
     if MULTI_RUN_MODE == 'confidence':
         print("  Multi-run mode: confidence — curves are mean ± std over all runs of a (model, flag)")
     else:
@@ -1818,17 +2280,18 @@ def main():
             # The table then shows across-seed means instead of one run's best epoch
             best_df = err_df.copy()
 
-    print("\n[3/7] Plotting training loss line plots...")
+    print("\n[3/7] Plotting training-loss line plots (train split)...")
     plot_training_loss(epoch_df)
 
-    print("\n[4/7] Plotting combined test-and-monitor metrics figure...")
+    print("\n[4/7] Plotting the combined training-loss & validation-metrics figure...")
     plot_combined_test_monitor(epoch_df)
 
-    print("\n[5/7] Plotting per-model comparison figures...")
+    print("\n[5/7] Plotting per-model comparison figures (train loss + validation AUC/F1)...")
     plot_per_model_comparison(epoch_df)
 
     print("\n[6/7] Plotting summary table...")
-    plot_summary_table(best_df, epoch_df, err_df=err_df)
+    plot_summary_table(best_df, epoch_df, err_df=err_df,
+                       thr_df=load_threshold_table(args.thr_csv))
     plot_config_legend()
 
     print("\n[7/7] Plotting score distributions and Wasserstein scatter...")
@@ -1843,7 +2306,17 @@ def parse_args():
     """CLI: --multi-run selects the run-selection policy, --seed-ci adds the across-seed aggregate."""
     import argparse
     parser = argparse.ArgumentParser(
-        description='Visualize the TensorBoard results under results/')
+        description='Visualize the TensorBoard results under <results-dir>/')
+    parser.add_argument('--results-dir', default=None,
+                        help='root holding <model>/<MMDD-HHMM>-<flag>[-s<seed>]/events.out.tfevents.* '
+                             '(default: <repo>/results, or $IMPUT_RESULTS_DIR)')
+    parser.add_argument('--out-dir', default=None,
+                        help='output directory for every figure/CSV/TeX '
+                             '(default: Analysis/visualization, or $IMPUT_OUT_DIR)')
+    parser.add_argument('--model-config', default=None,
+                        help=f'plot list: which models to draw and what to call them '
+                             f'(default: {plot_models.CONFIG_NAME} next to the results root, or '
+                             f'${plot_models.ENV_VAR})')
     parser.add_argument('--multi-run', choices=['longest', 'confidence'], default=MULTI_RUN_MODE,
                         help="policy when a (model, flag) has several runs (e.g. a seed ensemble): "
                              "'longest' keeps the run with the most epochs, 'confidence' keeps all "
@@ -1852,6 +2325,11 @@ def parse_args():
                         help='additionally aggregate the per-run best metrics into mean ± 95%% CI '
                              '(per-run CSV + summary CSV + annotated summary table); implies '
                              "--multi-run confidence")
+    parser.add_argument('--thr-csv', default=None,
+                        help="CSV with the Youden / F1-max operating thresholds per (model, flag) "
+                             "(default: Analysis/npy_roc_output_ci/roc_ci_summary.csv, else the "
+                             "per-run model_predictions_best_thresholds.json files; the summary "
+                             "table omits the two columns when neither exists)")
     return parser.parse_args()
 
 

@@ -24,9 +24,28 @@
 | `Bootstraps/bootstrap_v2_train.py` | Bootstrap v2（B 次重采样训练） | `Bootstraps/bootstrap_v2_config.yaml` | `DynamicGraphTrainer` / 复用入口 | `results/bootstrap_*` |
 | `Prediction/find_threshold*.py` | 阈值扫描（F1-max 等） | 模型 config（`load_config`） | — | 阈值与曲线 |
 | `Prediction/get_imputation_fast.py` | 全图连边打分（内部数据补全） | 模型 config + `Prediction/imputation_common.yaml` | — | 边分数 / 补全网络 |
-| `Analysis/visualize_results.py` | 读 eventfile → Table 3 / 汇总表；`--multi-run confidence` 画均值±std 带、`--seed-ci` 出跨 run mean ± 95% CI | — | — | `summary_table.*`、`best_metrics_table.csv`、`seed_ci_{per_run,summary}.csv` |
+| `Analysis/plot_models.py` | **绘图模型清单的唯一入口**：读数据集目录下的 `model_plot_config.json`（键=模型目录名、值=图上显示名、支持 `//` 注释与 `include:false`），供下面所有绘图脚本共用；找不到该文件=不过滤（画磁盘上发现的全部模型） | `model_plot_config.json`（在 `<results-dir>/` 或其上一级；`--model-config` / `$IMPUT_MODEL_CONFIG` 可显式指定） | — | 有序 `{模型: 显示名}`（**顺序=图例/配色顺序**） |
+| `Analysis/prepare_confidence_runs.py` | 把 `ensemble/<model>/sampling_<ts>/seedNN/<i>_<flag>_<role>/` 扁平化成 `confidence/<model>/<ts>-<flag>-sNN/`（`--zip` 可先解包回传 zip；幂等，跳过 `.ipynb_checkpoints/`）——**回传新模型后的第一步** | `ensemble/` 树（或 zip） | — | `confidence/` 树 |
+| `Analysis/visualize_results.py` | 读 eventfile → Table 3 / 汇总表（**`summary_table.png` = 每个负采样 regime 一块、左右并排**：左 `Intra-Indus (ftf)`、右 `All-Rand (fff)`，块标题取 `FLAG_PANEL`；每块的颜色**只在本块内**按列 min–max 重标定，避免易 regime 把难 regime 的对比压平）；`--multi-run confidence` 画均值±std 带、`--seed-ci` 出跨 run mean ± 95% CI；表内另有 **`Youden Thr` / `F1* Thr` 两个阈值列**（best ckpt 的跨 seed 平均工作点，**固定白底不染色**——阈值只是分数尺度地址不是优劣）；阈值取自 `Analysis/npy_roc_output_ci/roc_ci_summary.csv`（`--thr-csv` 可换），缺该 CSV 时退回各 run 的 `model_predictions_best_thresholds.json`，两者都没有则不出这两列 | — | — | `summary_table.*`、`best_metrics_table.csv`、`seed_ci_{per_run,summary}.csv` |
 | `Analysis/seed_ci_summary.py` | 读每个 repeat 的 `summary.yaml`（不依赖 TensorBoard）→ 多种子 mean ± 95% CI 表/图 | — | — | `seed_metrics.csv`、`seed_summary.{csv,md}`、`seed_ci_bars.png` |
 | `Analysis/PrROC_all_models.py` | 扫 `results/<model>/`，取每个模型 test AUC 最高的负采样配置，画多模型 ROC（+EdgeBank 基线） | `model_predictions_best_auc.npy` | — | `fig_roc_all_models.png`、`roc_curves_all_models.csv`、`roc_best_auc_summary.csv` |
+| `Analysis/PrROC_all_models_points.py` | 同上（import 复用其发现/配色/基线），但**画出每条曲线的 Youden 与 F1-max 两个工作点并标阈值**；(a) 全范围 + (b) 工作区放大 | 同上；阈值口径同 `utils.youden_f1max_thresholds`（本地复制，因 utils 顶层 import torch） | — | `fig_roc_all_models_f1youden.png`、`roc_f1_youden_summary.csv`（`--flag fff` 可出统一配置版） |
+| `Analysis/seed_ci_figures.py` | 读 `seed<NN>/<i>_<flag>_<role>/model_predictions_best_auc.npy`，画每个种子一条 ROC + 均值曲线 ± 95% CI 带，并在均值曲线上标出跨种子平均的两个工作点 | 各 run 的 `model_predictions_best_auc.npy` | — | `fig_roc_ci_grid_points.png`、`fig_roc_ci_overlay_points.png`、`fig_roc_ci_overlay_<flag>_points_zoom.png`（左全量+右工作区放大；**EdgeBank 基线只画在 (a)**：读 `Analysis/edgebank_baseline_results.csv`，形状=W、颜色=T、`--no-baseline` 可关，与 `PrROC.py` 同约定，图例置 (a) 内 center right、**`ncol=2` 两列竖排（左 W / 右 T）**；(a) 图例只写 `模型: AUC ± CI`（**手绘两列：模型名左对齐、`AUC ± CI` 右对齐**）、阈值只写在 (b)；**(b) 保持纯模型工作点放大**，不因基线点而把窗口拖到近平凡角）、`roc_ci_summary.{csv,md}`、`roc_ci_curves.csv`；**输出目录 `Analysis/npy_roc_output_ci/`**（与单次版 `Analysis/npy_roc_output/` 并列，原 `Analysis/visualization/seed_ci/` 已废弃） |
+
+**绘图模型清单（`model_plot_config.json`，2026-09-14）**：哪些模型进图、图上叫什么，只由**数据集目录下的这一个 JSON** 决定
+（现为 `results/四次双模式/model_plot_config.json`，含 9 个模型：BiGRU / EvolveGCN-H / EvolveGCN-H-LS /
+GAT-GRU / GAT-GRU\* / GAT-GRU-LS / GAT-GRU-FiLM / GAT-GRU\*-FiLM / BiTNA）。**去掉一个模型 = 注释掉对应那一行**（或该行写
+`"include": false`），`visualize_results.py`、`plot_train_4metrics.py`、`seed_ci_figures.py`、`seed_ci_summary.py`、
+`PrROC_all_models.py`、`PrROC_all_models_points.py` 会同时生效；新增模型则照抄一行即可（`key` 必须等于磁盘目录名）。
+脚本用 `--results-dir` 指向该数据集或其子目录（`ensemble`/`confidence`）时自动读取，也可 `--model-config PATH` 显式指定；
+**磁盘上有但未写进清单的目录一律不画**（打印 `[SKIP]`）。列表顺序即图例与配色顺序。
+
+**新增一个模型要动的地方（4 步，09-14 `gatgru2layer-smooth` 即按此接入）**：
+1. 回传 zip 解到 `results/<数据集>/ensemble/<模型目录名>/`（保留 `sampling_<ts>/seedNN/{i}_{flag}_{role}/` 原结构，`seed_ci_summary.py` 读这里的 `summary.yaml`）；
+2. 再扁平化一份到 `results/<数据集>/confidence/<模型目录名>/<ts>-<flag>-sNN/`（每 run 放 eventfile + `model_predictions_best*.npy` + `*_thresholds.json` + `thresholds_history.jsonl`，**排除 `.ipynb_checkpoints/`**），`visualize_results.py` / `plot_train_4metrics.py` 读这里——一步做完：
+   `python Analysis/prepare_confidence_runs.py <模型目录名> --zip results/<数据集>/<回传.zip>`（已解包过则去掉 `--zip`，重跑是幂等的）；
+3. 在 `model_plot_config.json` 里照抄一行（`key` = 目录名，`name` = 图上显示名）；
+4. `Analysis/visualize_results.py` 的 `BUILTIN_MODEL_DISPLAY`、`MODEL_BASE_COLORS`、`MODEL_METRIC_TAGS` 各补一条（**标签表漏了会让 best epoch 回退到 `Test/Epoch_AUC`**），`PrROC_all_models.py` 的 `MODEL_DISPLAY`/`MODEL_COLORS`、`seed_ci_figures.py` 的 `MODEL_COLORS`（>8 个模型要加色）同步。
 
 ### 0.2 端到端数据流
 
@@ -129,7 +148,8 @@ cfg = load_config('gatgru_vec')   # = deep_merge(common_config.yaml, Models/conf
 - **按键深合并，同名键模型文件赢**（`utils.deep_merge`）。
 - 因此"同一参数听谁的"由**键路径**决定，不是文件优先级：不同键路径即使同名也会**共存**且被不同消费方读取（历史案例：顶层 `trainer.patience` 与 `trainer.kwargs.patience` 曾同时存在、只有前者被读，已于 2026-09-12 收敛为单键，见 §8 陷阱 2）。
 - 所有读取模型配置的脚本都走 `load_config`（旧版 4 处直接 `yaml.safe_load(Models/configs/*.yaml)` 已统一）；
-  `Prediction/get_imputation_fast.load_imputation_config` 是等价的 inline 三段合并（common → model → `imputation_common.yaml`）。
+  `Prediction/get_imputation_fast.load_imputation_config` 是等价的 inline 三段合并（common → model → `imputation_common.yaml`），
+  **并额外决定"加载哪个模型"**：`--config` > `imputation_common.yaml: model.config_name` > `gatgru_vec`（见 §2.3）。
 
 ### 2.2 键归属
 
@@ -141,6 +161,7 @@ cfg = load_config('gatgru_vec')   # = deep_merge(common_config.yaml, Models/conf
 | `trainer.num_epochs` | common（**模型 yaml 不应覆盖**） | `DynamicGraphTrainer.train()`、`SEALTrainer.train()` | epoch **上限**（仅保底终止）；早停预算的唯一旋钮是 `trainer.selection.patience`（§5.3、§5.7）。旧顶层 `trainer.patience` 已于 2026-09-12 删除、不再被读取 |
 | `trainer.kwargs.margin_lambda` | common | `DynamicGraphTrainer.__init__` | BCE + Margin 权重 |
 | `trainer.kwargs.margin` | common | `DynamicGraphTrainer.__init__` | 排序损失要求的分数差（默认 `1.0`）；**所有头部以 Sigmoid 结尾 ⇒ 分数 ∈ [0,1]、可达最大差恰为 1.0**，故 `≥1.0` 只能靠饱和满足（见 §5.1） |
+| `trainer.kwargs.label_smoothing` | common | `DynamicGraphTrainer.__init__` | BCE 标签平滑系数（默认 `0.0`；**不写 = 写 0 = 关闭**）；`y' = y(1-ε)+(1-y)ε` 把 BCE 的最优 logit 从"无界"改成有限值 `log((1-ε)/ε)`（ε=0.05→2.94），是阈值漂移的校准手段（§5.1）；须与 `margin ≤ 1-2ε` 配套 |
 | `trainer.selection.*` | common | `DynamicGraphTrainer` | **选模/早停准则**（§5.3） |
 | `trainer.lr_schedule.*` | common | `DynamicGraphTrainer` | 学习率与调度（§5.4） |
 | `trainer.max_factset_edges` | common | `compute_factset_quantile` | FactSet 抽样上限 |
@@ -148,7 +169,26 @@ cfg = load_config('gatgru_vec')   # = deep_merge(common_config.yaml, Models/conf
 | `defaults.repeats` / `defaults.seed` | `sample_setting.yaml` | `run_sampling.py` | 重复运行次数与首种子（`--repeats/--seed` 覆盖）；`repeats>1` 启用 `seed<SEED>/` 布局（§5.8） |
 | `defaults.rotate_donor` | `sample_setting.yaml` | `run_sampling.py` | 是否每 repeat 轮换 backbone 供体（`--rotate_donor/--no_rotate_donor` 覆盖）；**只对 `repeats>1` 有效**（§5.8.1） |
 
-### 2.3 生效配置落盘（可审计）
+### 2.3 插补推理加载哪个模型（`Prediction/imputation_common.yaml`）
+
+| 键 | 作用 | 解析顺序 |
+|---|---|---|
+| `model.config_name` | 选 backbone：`Models/configs/<name>.yaml` | CLI `--config` **>** yaml **>** `gatgru_vec` |
+| `model.checkpoint` | 显式 `.pth`（相对项目根或绝对） | ① `checkpoint` |
+| `model.run_dir` | 训练输出目录（相对 `results/` 或绝对），取其下**最新**的 `checkpoint_name` | ② `run_dir`（找不到则告警并继续） |
+| `model.checkpoint_name` | 在 `run_dir` / `results/<output_subdir>/` 内搜索的文件名（默认 `best_model.pth`） | ③ `results/<output_subdir>/**` |
+| `model.strict` | `true` = ckpt 与架构键必须全匹配，否则报错（**首次换 backbone 建议开**） | — |
+| `model.device` | 设备（CLI `--device` 非 auto 时优先） | — |
+| `prediction.threshold_by_model` | `配置名 -> 阈值`；**分数尺度跨 backbone 不可比**（GAT-GRU Youden≈0.98、EGCN≈0.3），无条目则回全局 `threshold` 并打印来源 | — |
+| `data.time_steps` | 钉死年份轴；**留空**才按图+`year_range` 推断（年份索引是时序嵌入的地址，错一位全错位） | — |
+| `data.min_degree` | 构图的最小节点度（**默认 0 = 不过滤**，即历史行为）。规则与训练 `dataset.min_degree` 一致：度 = 节点作为端点的 `(src,tgt,year)` 出现次数，边**两端都达标**才保留 ⇒ 过滤的是**边**，图变稀疏、动态嵌入随之变化；`num_nodes`/节点索引不变（来自 embedding 表），ckpt 照常加载。填 `2` 即复现训练图 | — |
+| `data.exclude_low_degree_nodes` | 是否把度 < `min_degree` 的节点**排除出插补候选名单**（默认 `false` = 有 embedding 即候选，历史行为）。`true` = 只给"训练图里足够可见"的节点打分，避免阈值外推到度 0/1 节点；`min_degree <= 0` 时无效并告警。度按**未过滤**的正样本统计（否则节点的边被删后自身也会掉到阈值下，排除会雪崩） | — |
+
+约束与安全网：① `check_prediction_interface()` 只接受 `forward(node_pairs, time_indices)`（Temp-SEAL 需 k-hop 子图，**直接拒绝**）；
+② 只有 `static_encoder + temporal_encoder(单必填入参) + edge_predictor` 走嵌入预计算缓存，EGCN / 两类融合走逐 batch forward；
+③ ckpt **一个键都没命中直接报错**（防止换模型后拿随机权重静默推理）；④ 嵌入缓存写盘带 `meta`（config 名 + ckpt 路径/mtime + 节点数 + 年份轴），不一致即重算。
+
+### 2.4 生效配置落盘（可审计）
 
 `run_sampling.py` 在训练开始前写 `<run>/config.yaml`（全量合并后的 `merged_config` + `run` 元信息 + 4 模式开关摘要）；
 resume 时另写 `config_resume_{timestamp}.yaml`，保留首次的 `config.yaml`；`--dry_run` **完全不落盘**。
@@ -260,7 +300,7 @@ apply_node_feature_extractor(extractor, x) -> Tensor
 DynamicGraphTrainer(
     model, train_loader, test_loader, val_loader=None,
     device=..., log_dir=None, use_tensorboard=True,
-    margin_lambda=0.1, margin=1.0,
+    margin_lambda=0.1, margin=1.0, label_smoothing=0.0,
     factset_edges=None, node_mapping=None, reverse_node_mapping=None,
     static_data=None,
     selection_cfg=None,              # 选模/早停准则，见 §5.3（trainer.selection）
@@ -276,6 +316,9 @@ DynamicGraphTrainer(
 - `save_test_predictions=False` ⇒ `train()` 既不写 `model_predictions_best*.npy`，也不写配套的阈值记录（默认 `true`，与历史行为一致；见 §7）。
 - **`margin`（默认 `1.0`）的语义与值域约束**：排序损失为 `max(0, margin - (p_pos - p_neg))`，即"正样本分数必须比负样本高出的差"。模型头部一律以 `Sigmoid` 结尾 ⇒ 分数 ∈ `[0, 1]`、**可达最大差恰为 `1.0`**。于是 `margin ≥ 1.0` **只有在端点 `(p_pos=1, p_neg=0)` 才成立**，hinge 永不关闭、对每个样本对持续施加"往两端推"的恒定梯度 ⇒ 分数极化（正样本贴 1、可分离负样本贴 0）、概率校准变差（Brier 上升）、难负样本厚尾时最优阈值被挤进 `[0.9, 1.0]` 窄缝并跨 run 漂移（`results/ANALYSIS_0911_run_vs_paper.md` 同批诊断）。要做真正的"排序间隔"消融，把 `margin` 调到 `0.25` 量级，或改为在 **logit** 上做 margin（头部去掉 Sigmoid）。
 - `margin` 与 `margin_lambda` 都随 ckpt 落盘（见 §5.5），`run_sampling` 写入 `summary.yaml._meta.loss`：**不同 margin 的 run 不可混算**。
+- **`label_smoothing`（默认 `0.0` = 关闭；config `trainer.kwargs.label_smoothing`，键不写即 0）**：只作用于 **BCE 项**，目标变成 `y' = y(1-ε) + (1-y)ε`，于是损失的最优点从"越饱和越好"移到**有限 logit** `log((1-ε)/ε)`（ε=0.05→2.94、ε=0.1→2.20），正是 `ANALYSIS_0911` 诊断出的"BCE 在近可分训练集上把 logit 尺度推到无界 ⇒ Youden 阈值漂到 ~0.99"的对症手段。取值域 `[0, 0.5)`，越界在构造时直接抛 `ValueError`（ε=0.5 时两类目标都是 0.5，损失无类别信息）。
+- **`label_smoothing` 与 `margin` 必须配套**：排序损失**不平滑**，若 `margin > 1-2ε`，hinge 仍把每个样本对往饱和角推，会部分抵消平滑效果；`train()` 启动打印的协议段会给出告警与建议上界（ε=0.05 ⇒ margin ≤ 0.9）。平滑只改"绝对分数落在哪里"，不改"谁比谁高"，因此 AUC/排序类指标不受影响。
+- **`label_smoothing` 的作用域**：val/test 的 loss 与 `Train/*_BCE` **仍是硬标签**（跨 run / 跨 ε 可比），实际进入目标函数的平滑项另记在 `Train/*_BCE_smooth`、`history[i].train_bce_smooth` 与 ckpt 的 `train_bce_smooth`；`label_smoothing` 本身随 ckpt 与 `summary.yaml._meta.loss` 落盘。**只有 loss 数值本身不可与 ε=0 的 run 直接比，指标仍可比。**
 
 ### 5.2 `train()`
 
@@ -309,7 +352,7 @@ score         = smooth(select_metric)                              if use_factse
 - 最高分 ⇒ 覆盖写 `best_model.pth` 并把 `patience_counter` 清零；否则 `patience_counter += 1`，达到 `trainer.selection.patience` 即停——它是**唯一的早停旋钮**（2026-09-12 起旧顶层 `trainer.patience` 已删除且不再被读取；该键为空时回落代码常量 `EARLY_STOP_PATIENCE_DEFAULT = 10` 并打印告警）。
 - `best_auc_model.pth` 是**旁路产物**：只按选模 split 的**原始 AUC** 取最高，不参与早停计数（供曲线/阈值脚本使用）。
 - **test 阈值记录**（两个 trainer 的 `save_test_predictions_npy`）：每写一次 `model_predictions_best*.npy`，就对**刚写入的这批 test 分数**算一次 Youden's J 与 F1-max 阈值，打印到控制台并落两个文件——`<npy 名>_thresholds.json`（最新值，覆盖写）与同目录 `thresholds_history.jsonl`（每次追加一行，含 `tag`/`epoch`）。算法与键名和 `Prediction/find_threshold*.py` 完全一致（`utils.youden_f1max_thresholds`，实测逐位相同），**因此可与 `threshold_results.json` 直接比较**。注意三点口径：① 它描述的是**test** 分数，**不参与选模/早停**（那是选模 split 的事）；② F1-max 只在 `[0.1, 0.9)` 上细扫 step 0.001，**上界取不到**；③ 分数恒定（如 Temp-SEAL 退化）时 argmax J 落在 ROC 的 `+inf` 点，记录为 `youden_j=1.0` + `youden_j_at_inf=true`（避免写出 Infinity 字面量）。**开关**：顶层键 `save_test_predictions`（默认 `true`，见 §7）关掉时 `.npy` 与上述两个阈值文件**都不写**——守卫写在 `save_test_predictions_npy` 内部而非调用点，所有调用方（含将来的）自动遵守；`train()` 开头打印 `Save test predictions: on/off`。它只决定落不落盘，**不影响任何训练数字**。
-- 历史字段 `history[i]` 至少含：`epoch, selection_split, train_bce, train_margin, train_f1, train_auc, val_*, test_*, factset_quantile, wasserstein_diff, factset_quantile_test, wasserstein_diff_test, epoch_seconds, score_raw, score, lr`。
+- 历史字段 `history[i]` 至少含：`epoch, selection_split, train_bce, train_bce_smooth, train_margin, train_f1, train_auc, val_*, test_*, factset_quantile, wasserstein_diff, factset_quantile_test, wasserstein_diff_test, epoch_seconds, score_raw, score, lr`（`train_bce_smooth` = 该 epoch 实际最小化的 BCE，关闭平滑时等于 `train_bce`）。
 
 ### 5.4 学习率调度
 
@@ -339,7 +382,8 @@ score         = smooth(select_metric)                              if use_factse
 | test（只报告） | `test_loss`, `test_f1`, `test_auc` |
 | 准则登记 | `selection_criterion`（如 `EMA5(AUC)`）、`selection_score`（本次选模分）、`selection_score_raw`（未平滑）、`selection_metric`、`selection_use_factset`、`selection_ema_span`、`lr` |
 | FactSet | `factset_scope`, `factset_quantile`, `factset_wasserstein_{pos,neg,diff}` 及其 `_test` 版本 |
-| 损失权重 | `margin_lambda`, `margin` —— BCE + `λ·MarginRankingLoss` 的协议口径（不同值的 run 不可比） |
+| 损失权重 | `margin_lambda`, `margin`, `label_smoothing` —— BCE + `λ·MarginRankingLoss` 的协议口径（不同值的 run 不可比）；`label_smoothing: 0.0` = 硬标签（历史行为） |
+| 训练量（补充） | `train_bce_smooth` —— 该 epoch 实际最小化的平滑 BCE（关闭平滑时 == `train_bce`） |
 
 下游硬依赖：`Prediction/find_threshold*.py` 读 `val_auc/test_auc`；`run_sampling` 读 `selection_score` 与全部指标。**新增字段可，改名/删除不可。**
 
@@ -347,14 +391,19 @@ score         = smooth(select_metric)                              if use_factse
 
 | 标签 | 粒度 | 含义 |
 |---|---|---|
-| `Train/Batch_{BCE,Margin,F1,AUC}` | 每 10 batch | 训练侧 batch 曲线 |
-| `Train/Epoch_{BCE,Margin,F1,AUC}` / `Train/Epoch_LR` | epoch | 训练侧 epoch 汇总 |
-| `Val/Epoch_{Loss,F1,AUC}`, `Test/Epoch_{Loss,F1,AUC}` | epoch | 两个评测 split（不用作选模） |
+| `Train/Batch_{BCE,Margin,F1,AUC}` | 每 10 batch | 训练侧 batch 曲线；其中 `BCE` **恒为硬标签** BCE（跨 run / 跨 ε 可比） |
+| `Train/Epoch_{BCE,Margin,F1,AUC}` / `Train/Epoch_LR` | epoch | 训练侧 epoch 汇总（同上，`BCE` 恒为硬标签） |
+| `Train/Batch_BCE_smooth`, `Train/Epoch_BCE_smooth` | 同上 | **仅当 `trainer.kwargs.label_smoothing > 0` 才写入**：实际进入目标函数的平滑 BCE。与同名的 `BCE` 曲线不是一回事，单独出现时不要混读 |
+| `Val/Epoch_{Loss,F1,AUC}`, `Test/Epoch_{Loss,F1,AUC}` | epoch | 两个评测 split：`Val/*` 就是**选模 split**（与 `Monitor/*` 同源，见 §5.3），`Test/*` 只报告 |
 | `Monitor/*` | epoch | **选模 split** 的监控量：`Factset_Quantile`、`Wasserstein_*`、`Selection_Score`、`Selection_Score_EMA` |
 | `MonitorTest/*` | epoch | test split 的同名监控量（与 `Monitor/*` 永不共用曲线） |
 | `Val|Test/Batch_{Loss,F1,AUC}` | 每 10 batch | 仅供 SEAL 这类长 epoch 曲线 |
 | `Time/Epoch_Duration` | epoch | 每 epoch 秒数 |
 | `Score_Distribution/*` | epoch | 分数直方图（FactSet / 各 split 正负） |
+
+**轮次窗口（2026-09-13）**：凡以 epoch 为横轴的图 —— `plot_train_4metrics.py` 的 4 面板（`Analysis/figures`、`Analysis/figures_ci`）与 `visualize_results.py` 的 `training_loss.png`、`test_monitor_combined.png`（6 面板）、`per_model_*.png` —— 横轴一律截到 **`visualize_results.EPOCH_AXIS_MAX = 20`**（`plot_train_4metrics.py` 的 `PANELS` 直接引用该常量）。曲线数据本身仍是整轮，只是窗口收在 20 轮，避免早停后那段平坦曲线把前期的动态压扁。SEAL 的 step 轴是 batch 计数而非轮次，不受此限；`fig:train` 等论文用图同理不再出现 20 轮之后的部分。
+
+**图—split 口径（2026-09-13）**：折线图只用两个 split —— **损失类曲线取 `Train/*`，其余曲线一律取 `Val/*`（选模 split）**；**单次运行的曲线用 ★ 标出最终选中的 epoch**（`Val/Epoch_AUC` 的 argmax，落在该 run 自己的曲线上）。**多种子（`--multi-run confidence`）图一律不画 ★**：一条曲线是若干 repeat 的 mean ± std，而每个 repeat 各自选中不同 epoch（实测同一格可散到 5/9/11/17），取均值画一颗星等于宣称一个没人做过的选择；此类图底部改注 "seed ensemble: each curve is the mean ± std over the repeats and every repeat selects its own epoch, so no single selected epoch is marked"。开关见 `plot_train_4metrics.py::SELECTION_STARS`（= `MULTI_RUN_MODE != 'confidence'`），单 run 的选中 epoch 存于 `seed_ci_per_run.csv` 的 `best_epoch`。test 数据只出现在 `summary_table.png`：`Test/Epoch_AUC`、`Test/Epoch_F1`、`MonitorTest/Factset_Quantile`、`MonitorTest/Wasserstein_Diff`（`Train/Epoch_BCE` 列除外）。因此 `visualize_results.py` 的 `test_monitor_combined.png`（Train BCE + 5 个 val 面板）与 `plot_train_4metrics.py` 的四面板图都不再画 test 曲线，`Val/*` 与 `Test/*` 不会出现在同一张图里；`plot_test_metrics` 已改名为 `plot_validation_metrics`。取值实现见 `get_selected_epochs()` / `mark_selected_point()`。`plot_train_4metrics.py` 的子图标题统一带 split 前缀（`Train:` / `Validation:`）；图例改为**一列一个模型、一行一个设定**（`ncol = 模型数`，matplotlib 图例按列填充，故条目按"模型主序"排列），设定名由该脚本的 `SETTING_LABELS`/`SETTING_ORDER` 给出——当前只有 `ftf = Intra-Indus` 与 `fff = All-Rand` 两种（`filter_factset_neg` 在采样管线不生效，四 flag 实际只有 intra-industry 开/关两个 regime）。
 
 ### 5.7 `SEALTrainer`（`Training/train_dualseal.py`）差异
 
@@ -448,6 +497,7 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 | `trainer.max_factset_edges` | common | FactSet 统计 | 监控指标方差 |
 | `trainer.kwargs.margin_lambda` | common | trainer | BCE 与排序损失权衡 |
 | `trainer.kwargs.margin` | common | trainer | 排序损失要求的**分数差**（默认 `1.0`）；Sigmoid 头部 ⇒ 分数 ∈ [0,1]、可达最大差 = 1.0，故 `≥1.0` 等价"要求饱和"，会**恶化概率校准并让最优阈值漂进 `[0.9,1.0]` 窄缝**；消融用 `0.25` 量级（§5.1） |
+| `trainer.kwargs.label_smoothing` | common | trainer | BCE 标签平滑系数，默认 `0.0`，**不写 / 0 都是关闭（硬标签，历史行为）**；ε>0 时把 BCE 最优 logit 从"无界"改成有限值 `log((1-ε)/ε)`（0.05→2.94、0.1→2.20），**专治阈值漂移**；取值域 `[0, 0.5)`，越界抛 `ValueError`；须与 `margin ≤ 1-2ε` 配套（排序损失不平滑，§5.1）|
 | `save_test_predictions` | common **顶层** | 7 个入口 → trainer | 是否落 test 预测 `.npy` **及** §5.3 的阈值记录；默认 `true`。`false` 时 `save_test_predictions_npy` 直接返回（不跑那段推理、不写 3 个文件），**不影响训练数字**；`train()` 开头打印 `Save test predictions: on/off`；模型 yaml 可覆盖（`load_config` 里模型侧胜出） |
 | `pretrained.path` | common | 训练前 | 是否加载并冻结骨干 |
 | `defaults.repeats`, `defaults.seed` / `--repeats`, `--seed` | `sample_setting.yaml` / CLI | `run_sampling.py` | 重复运行次数与种子计划；`>1` 时启用 `seed<SEED>/` 隔离布局（§5.8） |
@@ -464,7 +514,7 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 2. **同键模型赢 / 不同键共存**：同一参数写在不同键路径会**共存**且被不同消费方读取。**epoch 上限与早停预算是全局键**：只在 `Training/common_config.yaml` 维护，模型 yaml 不要覆盖（`seal.yaml` 已于 2026-09-12 去掉 `num_epochs: 2` 与 `kwargs.patience`）。
    - **早停只有一个键**（2026-09-12 收敛）：顶层 `trainer.patience` 已删除，`DynamicGraphTrainer` 与 `SEALTrainer` 都不再读它；唯一旋钮是 `trainer.selection.patience`（为空 ⇒ 代码常量 `EARLY_STOP_PATIENCE_DEFAULT = 10` + 启动告警）。残留的 `trainer.patience` / `trainer.kwargs.patience` 会被 `Training/config_loader.py::_warn_on_deprecated_keys` 在**每次 `load_config`** 时点名警告，因此"写了却不生效"不会再静默。
 3. **`run_sampling.py` 恒用 `DynamicGraphTrainer`**：不读 config 的 `trainer.module/class`，所以"配置里写的 trainer 类型"不会生效。
-4. **协议入口必须成组检查**：`run_sampling.py` 与 5 个 `train_*.py` 都会传 `trainer.selection.*` / `trainer.lr_schedule.*` / `trainer.kwargs.margin_lambda` / `trainer.kwargs.margin`（2026-09-12 起统一；margin 于 2026-09-12 接通）。
+4. **协议入口必须成组检查**：`run_sampling.py` 与 5 个 `train_*.py` 都会传 `trainer.selection.*` / `trainer.lr_schedule.*` / `trainer.kwargs.margin_lambda` / `trainer.kwargs.margin` / `trainer.kwargs.label_smoothing`（2026-09-12 起统一；margin 于 2026-09-12 接通，label_smoothing 于 2026-09-13 新增，**不写 = 0 = 关闭**）。
    - 新增入口时如果漏传这几个键，会**静默回到旧协议**（0.5×FSQ + 0.5×AUC、恒定 lr、`margin=1.0`），而日志里看不出区别。`DynamicGraphTrainer` 的默认值就是旧协议，这是有意的向后兼容设计。
    - `SEALTrainer`（`train_dualseal.py`）只读 `trainer.kwargs` 的 lr/调度类键、**只有 BCE**（无排序损失），自成一套（`trainer.kwargs.lr_factor/lr_patience`，单位是评估次数）；但 epoch 上限与早停 patience 与共享 trainer 同源（§5.7）。
 5. **FactSet 抽样用全局随机源**（`random.sample`）⇒ 单次运行的该列不可与其它运行逐位比较。
@@ -495,15 +545,33 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 | 2026-09-12 | **多种子分析**：run 目录名可带 `-s<seed>`/`-seed<seed>` 后缀；多种子聚合开关；新增读 `summary.yaml` 的汇总脚本 | `Analysis/visualize_results.py`, `Analysis/plot_train_4metrics.py`, `Analysis/seed_ci_summary.py`（新增） | 新增 `parse_run_seed()`、`get_best_epoch_metrics_per_run()`、`aggregate_best_metrics()`、`report_seed_ci()`；`collect_all_data()` 记录新增 `seed` 列；`plot_summary_table(..., err_df=, err_label=)` 新增参数；`plot_train_4metrics.py` 新增 `--multi-run` | §5.8, §6, §7 |
 | 2026-09-12 | **backbone 供体轮换**：每 repeat 把模式顺序左移一位，让每个模式当一次 donor（默认开，仅 `repeats>1` 生效；`--no_rotate_donor` 可关） | `SampleSetting/run_sampling.py`, `SampleSetting/sample_setting.yaml`, `Analysis/seed_ci_summary.py` | 新增纯函数 `resolve_mode_order/mode_label/_role_of/_read_recorded_mode_orders/_metric_stats/aggregate_by_mode/_format_by_mode_report/_format_rotation_matrix`；`_run_one_repeat` 新增 `ctx['mode_order']` 覆盖 donor/frozen；CLI 新增 `--rotate_donor/--no_rotate_donor` + `defaults.rotate_donor`；run 根 `summary.yaml` 新增 `by_mode` 与 `_meta.donor_plan`；`config.yaml` 的 `run` 段新增 `rotate_donor/mode_order`（resume 依据）；`seed_ci_summary.py` 新增 `_mode_label/_role_of/detect_rotated_runs`，`seed_metrics.csv` 新增 `role/rotate_donor/donor_mode` 列，轮换时按模式分组 | §0.1, §0.2, §2.2, §5.8.1, §6, §7, §8 |
 | 2026-09-12 | 跨模型 ROC 图 | `Analysis/PrROC_all_models.py`（新增） | 每个模型取 test AUC 最高的 flag 画一条 ROC，附 Youden 点与 EdgeBank 基线；`--flag` 可强制统一配置 | §0.1, §6 |
+| 2026-09-13 | **多种子 ROC 产物目录改位 + 放大子图**：`Analysis/visualization/seed_ci/` → **`Analysis/npy_roc_output_ci/`**（与 `Analysis/npy_roc_output/` 并列），并新增"左全量 + 右工作区放大"的每模式一张图 | `Analysis/seed_ci_figures.py`, `Analysis/seed_ci_summary.py` | 两个脚本的 `--out-dir` 默认值改为 `npy_roc_output_ci`；`plot_overlay()` 拆出 `_draw_mean_panel()`；新增 `plot_overlay_zoom()`（放大窗口由该模式的 12 个工作点自动推导：`x_hi=max(fpr)*1.15+0.005`（夹在 0.05–0.5）、`y=min/max(tpr)∓0.07`），产物 `fig_roc_ci_overlay_<flag>_points_zoom.png` | §0.1 |
+| 2026-09-13 | **ROC 工作点标注版**：跨模型 ROC 上同时标出 Youden J 与 F1-max 两点及其阈值，并给出工作区放大子图；多种子 ROC 的均值曲线上标出跨种子平均的两个工作点 | `Analysis/PrROC_all_models_points.py`（新增）、`Analysis/seed_ci_figures.py` | 新脚本 import 复用 `PrROC_all_models` 的发现/配色/基线，自带 `_recorded_thresholds`（复制 `utils.youden_f1max_thresholds` 口径，避免绘图层 import torch）与 `_place_threshold_labels`（碰撞规避 + 不越出坐标框）；`seed_ci_figures.py` 的 `build_curves()` 每个种子新增 `youden_threshold/f1_threshold/youden_fpr/tpr/f1_fpr/tpr`，并新增 `ops` 均值块与 `_draw_op_points()`；输出 `fig_roc_all_models_f1youden.png`、`fig_roc_ci_{grid,overlay}_points.png`；**实测口径陷阱**：`F1_SCAN=(0.1,0.9,0.001)` 半开区间对 SEAL（分数≈1e-7）与 GAT-GRU（分数≈0.99 贴着上界）都取不到真最优 ⇒ 脚本用 `f1_scan_degenerate` / `f1_scan_mismatch`（exact − scan > 0.005）标记并改画精确 argmax（空心星） | §0.1, §6 |
 | 2026-09-12 | **属性 one-hot 改为"缺失 = 全 0 行"**：不再为缺失保留 `<NA>` 类，块宽 = 非空取值个数（属性捷径的对照组） | `Data/graph_dataset.py`（`_build_attr_onehot` + 两处 docstring）、`Training/common_config.yaml`、`Bootstraps/bootstrap_v2_config.yaml`、`README.md` | 词表宽度变化 ⇒ X 宽度 **−3**（每块少 1 列），旧 ckpt 与 `backbone.pth` 全部失效，须重跑 Phase 1；`attr_onehot_vocabs/sizes` 语义不变但值变小；节点行不再保证 unit row sum；`describe_node_features()` 打印尾部新增说明 | §3.4 |
 | 2026-09-12 | **融合单分支模型**：方案 3 时序注入（EvolveGCN-H 的 `W_t` 作用于 GAT 输出后再进 BiGRU）与方案 4 FiLM（只由 `W_t` 生成 `(γ_t, β_t)` 调制注意力输出），无晚期融合 | `Models/fusion_temporal_injection.py`（新增）、`Models/configs/fusion_temporal_injection.yaml`（新增）、`Models/fusion_film.py`（新增）、`Models/configs/fusion_film.yaml`（新增） | 纯新增，**不改任何既有接口**：沿用 §4.2 常规 forward 签名与 §4.4 冻结前缀；`MatGRUCell_PyG` 与 `precompute_adj_matrices` 为跨模块 import（未复制实现，`Models/egcn.py` 与 `Models/common_vectorized.py` 未改动）；`fusion_temporal_injection` 要求 `static_hidden_dim == fc_embed_dim`；`fusion_film` 新增 `summary_mode`/`mlp_hidden`/`film_unit_offset` 三个模型私有键（只写在自身 yaml，不进 `common_config.yaml`）；`FiLMGATGRU` 新增只读接口 `get_last_modulation()` / `get_last_modulated()` | §1.1, §1.2, §7 |
 | 2026-09-12 | **TI 恒等初值修复**：`fusion_temporal_injection` 原形式 `u_t = act(s_t W_t + A_t (s_t W_t))` 在真实图上塌陷（注入值 97.4% 为精确 0、2014 年后整段恒 0 ⇒ epoch 1 全部样本同侧，val AUC 0.4723 / P 0.5000 / R 1.0000 / Loss 1.53）⇒ 改为残差注入 + 每通道零初始化门 `u_t = s_t + g ⊙ (s_t W_t + A_t (s_t W_t))`，初值逐位等价 GAT-GRU（FiLM 零初始化 MLP 的同构做法） | `Models/fusion_temporal_injection.py`、`Models/configs/fusion_temporal_injection.yaml` | `TemporalInjectionEncoder`/`TemporalInjectionGATGRU` 新增 `residual_injection=True` 参数；新增 `injection_gate`（+128 参数，748,801 → 748,929）；残差路径**不加 `activation`**（投影均值≈0、量级 1e-4，ReLU 会归零并掐断 `g`/`W_t` 梯度）；`false` 保留原 `act` 形式供对照。自检 `_tmp_dump/probe_ti_init.py`（合成图）与 `_tmp_dump/probe_ti_real.py`（真实图 51,509 节点）：`max|p_TI−p_GAT-GRU| = 0`、GRU 输入 std 2.269e-02 且 0 个零 | §1.2, §7 |
 
 | 2026-09-12 | **早停收敛为单旋钮**：删除顶层 `trainer.patience`（此前它与 `trainer.selection.patience` 并存，后者非空时前者是死键）；唯一旋钮 `trainer.selection.patience`（为空 ⇒ 代码常量 `EARLY_STOP_PATIENCE_DEFAULT = 10` + 启动告警）；新增 `config_loader` 废弃键告警 | `Training/common_config.yaml`、`Training/trainer_common.py`、`Training/config_loader.py`、`Training/train_dualseal.py`、`Training/train_{gatgru,gatgru_1dire,bigru,egcn,tna}.py`、`SampleSetting/run_sampling.py`、`Models/configs/seal.yaml` | 新增常量 `trainer_common.EARLY_STOP_PATIENCE_DEFAULT = 10`；`DynamicGraphTrainer.train(patience=...)` 默认值 `10` → 该常量（数值不变）；`SEALTrainer.__init__(patience=15)` → 该常量；7 个入口不再读 `trainer_cfg['patience']`；`config_loader.load_config()` 新增 `_warn_on_deprecated_keys()`（残留 `trainer.patience` / `trainer.kwargs.patience` 时点名告警，干净配置静默）。**训练数字不变**：`selection.patience: 15` 一直生效 ⇒ 与 09-12 之前的 run 仍可比 | §2.1, §2.2, §5.2, §5.3, §5.7, §7, §8 |
+
+| 2026-09-13 | **轮次图统一 20 轮上限 + 多种子 zoom 图叠 EdgeBank + 左图图例精简** | `Analysis/visualize_results.py`、`Analysis/plot_train_4metrics.py`、`Analysis/seed_ci_figures.py` | `visualize_results.py` 新增常量 `EPOCH_AXIS_MAX = 20` 并替换 5 处硬编码（`plot_epoch_lines` 的 `<=20`、`plot_combined_test_monitor` 的 `<=20`、另一处 `<=40`、6 面板 `panels` 的 `20/20/20/20/40/40`、`plot_per_model_comparison` 的 `min(model_max_epoch, 20)`）；`plot_train_4metrics.py` 的 `PANELS` 四面板 `epoch_limit` 改引 `vr.EPOCH_AXIS_MAX`（原 40/20/20/40）。`seed_ci_figures.py` 新增 `BASELINE_CSV/WINDOW_SHAPES/THRESHOLD_COLORS/EDGEBANK_LEGEND_TITLE`、`load_edgebank()`、`_draw_edgebank()`；`_draw_mean_panel(..., label_mode='full'|'auc')`；`plot_overlay_zoom(..., edgebank=None)` **只在 (a) 叠基线**（图例置 (a) 内 center right，不挂到坐标框外），(b) 保持纯模型工作点放大、窗口仍只由模型工作点推导（基线 TPR≤0.234 会把窗口拖到近平凡角，用户决定不要）；新增 CLI `--baseline-csv/--no-baseline`；新增 `_draw_aligned_models_legend()` 替代 (a) 的 `ax.legend(loc='lower right')`——手绘两列（**名称左对齐 / `AUC ± CI` 右对齐**，列宽按 `renderer` 实测字宽定，白框 `Rectangle`），并把 (a) 的 `set_xlim/set_ylim` 提前到图例之前（避免 `add_line` 触发自动缩放）。重绘 `Analysis/{figures,figures_ci}/*`、`Analysis/visualization{,_ci}/*`、`Analysis/npy_roc_output_ci/fig_roc_ci_*.png` | §0.1, §5.6 |
 | 2026-09-12 | **落 test 预测时一并报告/记录阈值**：对刚写入 npy 的 test 分数算 Youden's J 与 F1-max，控制台打印 + 落 `<npy>_thresholds.json` 与 `thresholds_history.jsonl` | `utils.py`（新增 `youden_f1max_thresholds`、`F1_SCAN`）、`Training/trainer_common.py`、`Training/train_dualseal.py` | `save_test_predictions_npy` 签名新增可选参数 `epoch=None, tag=''`（旧调用无需改动）；新增方法 `_record_test_thresholds`；`utils.py` 新增纯函数（仅输出诊断，**不接入选模/早停**）；npy 内容与既有读取方（`PrROC*.py`）完全不变 | §0.2, §5.3, §7 |
 | 2026-09-12 | **接通 `save_test_predictions` 开关**（此前是无人读取的死键） | `Training/common_config.yaml`、`Training/trainer_common.py`、`Training/train_dualseal.py`、`Training/train_{gatgru,gatgru_1dire,bigru,egcn,tna}.py`、`SampleSetting/run_sampling.py` | 两个 trainer 构造新增 `save_test_predictions=True`（默认 true ⇒ 行为不变）；守卫在 `save_test_predictions_npy` 内部，关掉即同时跳过 `.npy` 与阈值记录；7 个入口按 `cfg.get('save_test_predictions', True)` 透传；`train()` 前导打印新增一行 | §5.3, §7 |
 | 2026-09-12 | **接通 `trainer.kwargs.margin`**（此前恒为构造默认 1.0，配置改不动） | `Training/common_config.yaml`、`Training/trainer_common.py`、`Training/train_{gatgru,gatgru_1dire,bigru,egcn,tna}.py`、`SampleSetting/run_sampling.py` | 新增配置键 `trainer.kwargs.margin`（默认 `1.0` ⇒ 行为不变）；6 个 DynamicGraphTrainer 入口按 `trainer.kwargs.margin` 透传；trainer 新增 `self.margin` 并写入两个 ckpt（`margin`/`margin_lambda`）、前导打印一行；`summary.yaml._meta` 新增 `loss.{margin_lambda,margin}`。**语义**：头部是 Sigmoid ⇒ 分数 ∈ [0,1]、可达最大差 = 1.0，`margin ≥ 1.0` 退化为"要求饱和"（打分极化 / 校准恶化 / 阈值漂移），消融用 `0.25` 量级 | §4, §5.1, §5.5, §7, §8 |
 | 2026-09-12 | **Temp-SEAL 不再在模型配置里限定训练轮次，改由 common 的 patience 决定**：`seal.yaml` 删除 `trainer.num_epochs: 2` 与 `trainer.kwargs.patience: 15`（继承 `common_config` 的 `num_epochs: 60` 作保底上限）；`SEALTrainer.train(num_epochs=None, patience=None)` 接通 **epoch 级早停**（连续 N 个 epoch 未刷新 step 级选模 F1 即停，与 checkpoint 同一准则），patience 解析顺序 `trainer.selection.patience → trainer.patience` 与 `DynamicGraphTrainer` 完全一致 | `Models/configs/seal.yaml`、`Training/train_dualseal.py`、`Training/common_config.yaml`、`Analysis/visualize_results.py` | `SEALTrainer.train()` 签名 `num_epochs` 默认值 2 → `None`（不设上限），新增 `patience` 形参（None → 用 `__init__` 值，0 → 关早停）；新增属性 `early_stopped`，`early_stop_counter` 由占位变实数；`run_summary.json` 新增 `epochs_planned/patience/early_stopped` 且 `epochs` 改为实际轮次；`visualize_results.py` 新增 `read_recorded_epochs()` 并把写死的 `default_num_epochs = 2` 换成 run 自记录值（`compute_epoch_duration_from_walltime(..., num_epochs=)`） | §0.1, §2.2, §5.7, §6, §7, §8 |
+
+| 2026-09-13 | **四指标图标题带 split 前缀 + 图例「一列一模型、一行一设定」**：子图标题改 `Train: BCE Loss` / `Validation: AUC` / `Validation: Factset Quantile` / `Validation: Wasserstein Diff (Neg−Pos)`；图例条目改「模型 · 设定」，`ncol = 模型数`（matplotlib 图例按列填充 ⇒ 模型主序即一列一模型），缺 run 的格子补空条目避免列串行 | `Analysis/plot_train_4metrics.py` | 新增 `SETTING_LABELS`/`SETTING_ORDER`（`ftf = Intra-Indus`、`fff = All-Rand`，`ftt`/`tff` 保留旧名备用）与 `_setting()`；`PANELS` 标题改写；`_resolve_tag()` 命中 `Test/*` 回退时标题追加 `[legacy run: test curve]`，避免标题声称的 split 与曲线不符；两套图（`Analysis/figures`、`Analysis/figures_ci`）已重绘 | §5.6 |
+
+| 2026-09-13 | **多种子图不再画"选中 epoch" ★**：`--multi-run confidence` 的一条曲线是若干 repeat 的 mean ± std，而每个 repeat 各自选中不同 epoch（实测 TNA 5/9/11/17、EGCN-H 0/2/6/10、GAT-GRU·Intra-Indus 3/6/10/10），取均值标一颗星等于宣称一个没人做过的选择 | `Analysis/plot_train_4metrics.py`、`Analysis/visualize_results.py` | `plot_train_4metrics.py` 新增 `SELECTION_STARS`（= `MULTI_RUN_MODE != 'confidence'`）与 `CI_NO_MARKER_NOTE`，`selected` 仅在画星时取；`visualize_results.py` 的 `get_selected_epochs()`/`mark_selected_point()` 文档改为"仅限单 run 曲线"（逻辑不变）；重绘 `Analysis/figures_ci/fig_train_4metrics*.png`（无星）与 `Analysis/figures/*`（有星） | §5.6 |
+
+| 2026-09-13 | **BCE 标签平滑（可选，默认关）**：新增 `trainer.kwargs.label_smoothing`，**不写 = 0 = 硬标签**；ε>0 时 BCE 目标变 `y' = y(1-ε)+(1-y)ε`，损失最优 logit 从"无界"变有限值 `log((1-ε)/ε)`，用于抑制 logit 尺度无界导致的阈值漂移 | `Training/trainer_common.py`、`Training/common_config.yaml`、`Training/train_{gatgru,gatgru_1dire,bigru,egcn,tna}.py`、`SampleSetting/run_sampling.py` | 新增构造参数 `label_smoothing=0.0`（6 个 DynamicGraphTrainer 入口按 `trainer.kwargs.label_smoothing` 透传，键缺失即 0）；新增模块级 `_resolve_label_smoothing()`（`[0, 0.5)` 越界抛 `ValueError`）；`train_epoch` 新增 `total_bce_smooth_loss` 与 `self.last_train_bce_smooth`，TB 新增 `Train/Batch_BCE_smooth`、`Train/Epoch_BCE_smooth`（**仅 ε>0 时写入**，`Train/*_BCE` 恒为硬标签 ⇒ 跨 run 可比）；两个 ckpt 新增 `label_smoothing`、`train_bce_smooth`；`history[i]` 新增 `train_bce_smooth`；`summary.yaml._meta.loss` 新增 `label_smoothing`；`train()` 前导打印新增一行且在 `margin > 1-2ε` 时告警；`run_sampling` 的 "Effective trainer" 回显加入该键。**不传即旧行为，训练数字逐位不变**。自检 `_tmp_dump/_smoke_label_smoothing.py`（ε=0 无 `_smooth` 标签 / ε=0.05 有 / `margin=0.9` 不告警、`1.0` 告警 / 0.5、-0.1、1.0、`'x'` 全部拒绝） | §2.2, §5.1, §5.3, §5.5, §5.6, §7, §8 |
+| 2026-09-14 | **新增模型 `gatgru2layer-smooth`（= GAT-GRU-LS，2 层 + `label_smoothing: 0.1`，run 0913-1951）接入全部绘图** | `results/四次双模式/model_plot_config.json`（用户添加）、`Analysis/visualize_results.py`、`Analysis/PrROC_all_models.py`、`Analysis/seed_ci_figures.py`、**新增** `Analysis/prepare_confidence_runs.py` | `BUILTIN_MODEL_DISPLAY`/`MODEL_BASE_COLORS`(`spring`)/`MODEL_METRIC_TAGS` 各补一条（**漏 `MODEL_METRIC_TAGS` 会让 best epoch 静默回退到 `Test/Epoch_AUC`**）；`PrROC_all_models.py` 的 `MODEL_DISPLAY`/`MODEL_COLORS`(`#9edae5`)、`seed_ci_figures.py` 的 `MODEL_COLORS` 扩到 9 色（原 8 色会让第 9 个模型循环复用第一个颜色）；新脚本负责 ensemble→confidence 扁平化（`--zip`、幂等、跳过 `.ipynb_checkpoints/`）；4seed 结果 ftf 0.9101±0.0170 / fff 0.9378±0.0189，阈值由 GAT-GRU\* 的 0.974/0.648 降到 0.849/0.559 | §0.1 |
+| 2026-09-15 | **汇总表改为按 regime 左右两块**：`summary_table.png` 从"ftf/fff 上下叠在一张表"变成左右两张表（左 `Intra-Indus (ftf)`、右 `All-Rand (fff)`），**每块颜色只在本块内按列 min–max 重标定**（避免易 regime 把难 regime 的对比压平） | `Analysis/visualize_results.py::plot_summary_table` | 新增常量 `FLAG_PANEL`（块标题）；`plot_summary_table` 内部改为"按 flag 分块"，每块自带 `_block_colors()`（原整表归一化改为逐块归一化），行标签回到纯模型名（flag 移到块标题），两块共用同一套列宽/行高几何以保证逐行对齐，`fig.suptitle` 出总标题、块标题用 `ax.set_title`；`best_metrics_table.csv` 的行序与列名**逐字不变**（仍是 `Model [flag]`、模型主序） | §0.1 |
+
+| 2026-09-15 | **汇总表新增两个阈值列 `Youden Thr` / `F1* Thr`（固定白底不染色）**：不再需要翻 `roc_ci_summary.csv` 才能对照"这个模型的 0.5 到底偏不偏"；两列取 best ckpt 的**跨 seed 平均工作点**，位置在指标列与 `Avg Time/Epoch` 之间，**不参与热力图、不给 ± CI**（阈值是分数尺度地址不是优劣量，且 min/max 跨度与"均值的 CI"不是同一量） | `Analysis/visualize_results.py`（`load_threshold_table()`、`plot_summary_table(..., thr_df=)`、`--thr-csv`） | 新增模块常量 `THR_CSV_CANDIDATES` 与 `load_threshold_table()`：优先 `Analysis/npy_roc_output_ci/roc_ci_summary.csv` 的 `youden_threshold_mean` / `f1_threshold_mean`（与 ROC-CI 图、`roc_ci_summary.md` 同源），否则回退扫描 `RESULTS_DIR/**/model_predictions_best_thresholds.json` 按 (model, flag) 取均值（同一 `youden_f1max_thresholds` 口径），都没有则**不加列**（单 run 老结果布局不变）；`thr_col_idx` 只用于格式化与白色填充，`n_metric_cols` 染色循环不碰它；标题带 +0.2 in 供第二行脚注 | §0.1 |
+
+| 2026-09-15 | **插补推理改成配置驱动换模型**：`get_imputation_fast.py` 不再只认 `--config`，可由 `imputation_common.yaml` 的 `model.config_name / checkpoint / run_dir / checkpoint_name / strict / device` 决定加载哪个 backbone，并按 `prediction.threshold_by_model` 取各自的分数阈值 | `Prediction/get_imputation_fast.py`、`Prediction/imputation_common.yaml` | 新增 `IMPUTATION_YAML`/`DEFAULT_MODEL_CONFIG`、`_load_yaml`/`_imputation_yaml`/`resolve_model_config_name`（`--config` > yaml > `gatgru_vec`）、`check_prediction_interface`、`_newest_checkpoint`；`_find_checkpoint` 改为三级解析；`EmbeddingCache` 新增 `meta`（ckpt 路径+mtime+config 名+节点数+年份轴，不符即重算）与"temporal_encoder 必填入参≤1"判定（FiLM/TI 与 EGCN 走逐 batch forward）；`load_model` 新增 0 键命中直接报错、`strict` 校验、`data.time_steps` 钉年份轴；`--config` 默认值 `gatgru_vec` → `None`（yaml 可生效）。**旧行为不变**：不填即 `gatgru_vec` + 全局 threshold 0.452 | §2.3, §9 |
+
+| 2026-09-15 | **插补构图支持 `min_degree` + 低度节点可排除**：`data.min_degree`（默认 0 ⇒ 行为与之前逐字一致）决定推理图的边过滤（与训练同规则：两端度都达标才留边）⇒ 决定动态嵌入的计算图；`data.exclude_low_degree_nodes`（默认 `false`）为 `true` 时把度 < `min_degree` 的节点剔除出插补候选名单，不再给训练图里几乎不可见的度 0/1 节点打分 | `Prediction/get_imputation_fast.py`、`Prediction/imputation_common.yaml` | 新增 `compute_node_degrees()`（一次轻量查询，按**未过滤**正样本统计端点次数）与 `ImputationPredictorFast._filter_low_degree_companies()`（取完行业公司后过滤，随后才估算候选量）；`load_model` 的 `min_degree` 从写死 0 改为读 `data.min_degree`，并写入 `model_info` 与嵌入缓存 `meta`（换 `min_degree` 自动重算，避免拿旧缓存静默推理）；CLI 新增 `--min-degree`、`--exclude-low-degree-nodes`/`--keep-low-degree-nodes`；启动与 run 各打印一行；`min_degree<=0` 而开关为 `true` 时打印告警并忽略 | §2.3, §9 |
 
 ### 9.1 改动检查清单
 

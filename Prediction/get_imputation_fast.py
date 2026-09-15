@@ -5,13 +5,26 @@ Batch-writes candidate edges whose prediction score exceeds the threshold back t
 Neo4j (source='imputation'), using background writer threads + UNWIND batch MERGE
 to reduce network round trips.
 
+Which trained backbone is loaded is decided in Prediction/imputation_common.yaml:
+
+    model.config_name   Models/configs/<name>.yaml (CLI --config overrides it)
+    model.checkpoint    explicit .pth (highest priority)
+    model.run_dir       training output dir, newest best_model.pth inside wins
+    (both empty)        results/<output_subdir>/**/best_model.pth
+
 Usage:
-    python Prediction/get_imputation_fast.py --config gatgru_vec [--checkpoint path/to/model.pth]
+    python Prediction/get_imputation_fast.py                       # uses model.config_name in the YAML
+    python Prediction/get_imputation_fast.py --config egcn          # CLI overrides the YAML
+    python Prediction/get_imputation_fast.py --checkpoint path/to/model.pth
 
 Main parameters:
     --num-writers N    number of writer threads (1 recommended, avoids Neo4j deadlock)
     --flush-size N     number of edges accumulated before a batch write (default 500)
     --query-threads N  number of Neo4j query threads
+    --min-degree N     minimum node degree used to build the graph (data.min_degree, 0 = every edge)
+    --exclude-low-degree-nodes / --keep-low-degree-nodes
+                       drop / keep nodes with degree < min_degree in the candidate lists
+                       (data.exclude_low_degree_nodes)
 """
 
 import sys
@@ -48,37 +61,61 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # Config loading
 
-def load_imputation_config(model_config_name: str) -> dict:
-    """Load the full config: common_config.yaml -> model_config.yaml -> imputation_common.yaml"""
+IMPUTATION_YAML = os.path.join(ROOT_DIR, 'Prediction', 'imputation_common.yaml')
+DEFAULT_MODEL_CONFIG = 'gatgru_vec'
+
+
+def _load_yaml(path: str) -> dict:
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+
+def _imputation_yaml() -> dict:
+    """Prediction/imputation_common.yaml (missing file -> defaults + a warning)"""
+    if os.path.exists(IMPUTATION_YAML):
+        return _load_yaml(IMPUTATION_YAML)
+    print(f"[WARN] Imputation config file not found: {IMPUTATION_YAML}, using default parameters")
+    return {}
+
+
+def resolve_model_config_name(cli_config: Optional[str] = None) -> str:
+    """Which Models/configs/<name>.yaml to load: CLI --config > imputation_common.yaml > default"""
+    if cli_config:
+        return cli_config
+    from_yaml = (_imputation_yaml().get('model', {}) or {}).get('config_name', '')
+    return from_yaml or DEFAULT_MODEL_CONFIG
+
+
+def load_imputation_config(cli_config: Optional[str] = None) -> dict:
+    """Load the full config: common_config.yaml -> model_config.yaml -> imputation_common.yaml.
+
+    The model config name comes from the CLI when given, otherwise from
+    imputation_common.yaml (model.config_name), so switching backbone needs no CLI flag.
+    """
+    model_config_name = resolve_model_config_name(cli_config)
+
     training_dir = os.path.join(ROOT_DIR, 'Training')
     common_path = os.path.join(training_dir, 'common_config.yaml')
-    with open(common_path, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
+    cfg = _load_yaml(common_path)
 
     model_config_dir = os.path.join(ROOT_DIR, 'Models', 'configs')
     yaml_path = os.path.join(model_config_dir, f"{model_config_name}.yaml")
     if os.path.exists(yaml_path):
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            model_cfg = yaml.safe_load(f)
-        cfg = deep_merge(cfg, model_cfg)
+        cfg = deep_merge(cfg, _load_yaml(yaml_path))
     elif os.path.exists(model_config_name):
-        with open(model_config_name, 'r', encoding='utf-8') as f:
-            model_cfg = yaml.safe_load(f)
-        cfg = deep_merge(cfg, model_cfg)
+        cfg = deep_merge(cfg, _load_yaml(model_config_name))
     else:
         raise FileNotFoundError(
             f"Model config not found: {model_config_name} "
             f"(looked in {model_config_dir})"
         )
 
-    impu_path = os.path.join(ROOT_DIR, 'Prediction', 'imputation_common.yaml')
-    if os.path.exists(impu_path):
-        with open(impu_path, 'r', encoding='utf-8') as f:
-            impu_cfg = yaml.safe_load(f)
-        cfg = deep_merge(cfg, impu_cfg)
-    else:
-        print(f"[WARN] Imputation config file not found: {impu_path}, using default parameters")
+    cfg = deep_merge(cfg, _imputation_yaml())
 
+    # The resolved name is the single source of truth downstream (checkpoint search, per-model
+    # threshold, embedding-cache fingerprint, output.model_name fallback).
+    cfg.setdefault('model', {})['config_name'] = model_config_name
+    cfg['model_config_name'] = model_config_name
     return cfg
 
 
@@ -87,17 +124,33 @@ def load_imputation_config(model_config_name: str) -> dict:
 class EmbeddingCache:
     """Dynamic embedding precomputation cache manager (same as get_imputation.py)"""
 
-    def __init__(self, model: nn.Module, year_to_idx: dict, num_timesteps: int):
+    def __init__(self, model: nn.Module, year_to_idx: dict, num_timesteps: int,
+                 meta: Optional[dict] = None):
         self.model = model
         self.year_to_idx = year_to_idx
         self.num_timesteps = num_timesteps
         self.dynamic_hidden_dim = None
         self._cached = None
+        # Identity of the run the cached embeddings belong to (checkpoint / config / graph size).
+        # A cached file whose meta differs is dropped and recomputed, so switching backbone or
+        # checkpoint can never silently reuse another model's embeddings.
+        self.meta = dict(meta or {})
 
     def is_compatible(self) -> bool:
-        return (hasattr(self.model, 'static_encoder') and
+        if not (hasattr(self.model, 'static_encoder') and
                 hasattr(self.model, 'temporal_encoder') and
-                hasattr(self.model, 'edge_predictor'))
+                hasattr(self.model, 'edge_predictor')):
+            return False
+        # Fusion backbones (FiLM / temporal injection) feed extra tensors into the temporal encoder,
+        # which this cache path cannot supply -> fall back to the per-batch forward.
+        try:
+            params = inspect.signature(self.model.temporal_encoder.forward).parameters
+        except (TypeError, ValueError):
+            return True
+        required = [p for p in params.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    and p.default is p.empty]
+        return len(required) <= 1
 
     def precompute_embeddings(self, force: bool = False,
                                save_path: str = "",
@@ -180,6 +233,7 @@ class EmbeddingCache:
                 'year_to_idx': self.year_to_idx,
                 'num_timesteps': self.num_timesteps,
                 'dynamic_hidden_dim': self.dynamic_hidden_dim,
+                'meta': self.meta,
             }, path)
             print(f"[EmbeddingCache] Embeddings saved to: {path}")
 
@@ -188,6 +242,10 @@ class EmbeddingCache:
             return None
         try:
             data = torch.load(path, map_location='cpu', weights_only=False)
+            cached_meta = data.get('meta')
+            if self.meta and cached_meta is not None and cached_meta != self.meta:
+                print(f"[EmbeddingCache] Cache is stale ({cached_meta} != {self.meta}), recomputing")
+                return None
             self._cached = data['embeddings']
             self.dynamic_hidden_dim = data.get('dynamic_hidden_dim')
             print(f"[EmbeddingCache] Embeddings loaded: {path}")
@@ -206,6 +264,12 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
     impu_data_cfg = cfg.get('data', {})
 
     print("\n[1/4] Loading full dataset...")
+    # data.min_degree (Prediction/imputation_common.yaml) drives the inference graph. 0 (default)
+    # keeps every edge - the historical behaviour. A positive value applies the same EDGE filter as
+    # training (both endpoints must reach the threshold), so the dynamic embeddings are computed on
+    # a sparser graph. Node ids / num_nodes never change (they come from the embedding table).
+    min_degree = int(impu_data_cfg.get('min_degree', 0) or 0)
+    print(f"  min_degree: {min_degree} (0 = keep every edge)")
     DataModule = importlib.import_module(ds_cfg['module'])
     CompanySupplyDataset = getattr(DataModule, 'CompanySupplyDataset')
     build_static_graph = getattr(DataModule, 'build_static_graph')
@@ -217,7 +281,7 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         'negative_ratio': 0,
         'embedding_name': impu_data_cfg.get('embedding_name', 'embedding'),
         'toy_mode': cfg.get('toy_mode', False),
-        'min_degree': 0,
+        'min_degree': min_degree,
         'source_filter': impu_data_cfg.get('source_filter', 'semi'),
     }
     extra_candidates = {
@@ -243,12 +307,21 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
 
     print("\n[3/4] Initializing model...")
     ModelClass = import_attr(model_cfg['module'], model_cfg['class'])
+    print(f"  Model config: {cfg.get('model_config_name', 'N/A')} ({cfg.get('name', 'N/A')})")
+    print(f"  Model class:  {model_cfg['module']}.{model_cfg['class']}")
 
-    time_steps = sorted(dynamic_data.edge_time.unique().tolist())
-    for y in year_range:
-        if y not in time_steps:
-            time_steps.append(y)
-    time_steps = sorted(time_steps)
+    pinned_time_steps = impu_data_cfg.get('time_steps') or []
+    if pinned_time_steps:
+        # data.time_steps must reproduce the axis the checkpoint was trained on; keep the inference
+        # default otherwise (year positions are the address into the temporal embeddings).
+        time_steps = sorted(int(y) for y in pinned_time_steps)
+    else:
+        time_steps = sorted(dynamic_data.edge_time.unique().tolist())
+        for y in year_range:
+            if y not in time_steps:
+                time_steps.append(y)
+        time_steps = sorted(time_steps)
+    print(f"  Time steps ({len(time_steps)}): {[int(t) for t in time_steps]}")
 
     auto_context = {
         'num_features': dynamic_data.x.size(1),
@@ -266,12 +339,17 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         model = ModelClass(**model_kwargs).to(device)
 
     print("\n[4/4] Loading model weights...")
+    check_prediction_interface(model)
+
     impu_model_cfg = cfg.get('model', {})
     checkpoint_path = impu_model_cfg.get('checkpoint', '') or _find_checkpoint(cfg, model_cfg)
+    if checkpoint_path and not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(ROOT_DIR, checkpoint_path)
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}\n"
-            f"Please specify the model path via the --checkpoint argument"
+            f"Set model.checkpoint (or model.run_dir) in Prediction/imputation_common.yaml, "
+            f"or pass --checkpoint"
         )
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -286,43 +364,143 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
             filtered_dict[k] = v
         else:
             skipped.append(k)
+    missing = [k for k in model_state if k not in filtered_dict]
     if skipped:
-        print(f"  Skipped {len(skipped)} mismatched parameter keys")
+        print(f"  [WARN] Skipped {len(skipped)} checkpoint keys not matching the architecture "
+              f"(e.g. {skipped[:3]})")
+    if missing:
+        print(f"  [WARN] {len(missing)} model parameters left at random init "
+              f"(e.g. {missing[:3]})")
+    if not filtered_dict:
+        raise RuntimeError(
+            f"No checkpoint parameter matched {model_cfg['module']}.{model_cfg['class']}: "
+            f"the checkpoint was almost certainly trained on another backbone or feature width. "
+            f"Check model.config_name / model.checkpoint in Prediction/imputation_common.yaml.\n"
+            f"  checkpoint: {checkpoint_path}"
+        )
+    strict = bool(impu_model_cfg.get('strict', False))
+    if strict and (skipped or missing):
+        raise RuntimeError(
+            f"model.strict=true but checkpoint and architecture disagree "
+            f"(skipped={len(skipped)}, missing={len(missing)}).\n"
+            f"  checkpoint: {checkpoint_path}\n"
+            f"  model:      {model_cfg['module']}.{model_cfg['class']}"
+        )
 
     model.load_state_dict(filtered_dict, strict=False)
     model.eval()
     print(f"  Model weights loaded: {checkpoint_path}")
-    if 'best_f1' in checkpoint:
-        print(f"  best_f1: {checkpoint['best_f1']:.4f}")
+    print(f"  Matched {len(filtered_dict)}/{len(model_state)} parameter tensors")
+    for key in ('best_f1', 'best_auc', 'epoch'):
+        if key in checkpoint:
+            print(f"  {key}: {checkpoint[key]}")
 
     year_to_idx = {int(year): i for i, year in enumerate(time_steps)}
     model_info = {
         'year_to_idx': year_to_idx,
         'time_steps': time_steps,
         'num_nodes': dynamic_data.num_nodes,
+        'min_degree': min_degree,
         'checkpoint_path': checkpoint_path,
     }
     return model, model_info, full_dataset, dynamic_data
 
 
-def _find_checkpoint(cfg: dict, model_cfg: dict) -> Optional[str]:
-    output_subdir = cfg.get('output_subdir', '')
-    if not output_subdir:
+def compute_node_degrees(full_dataset) -> Dict[int, int]:
+    """Degree per PyG node index, counted on the UNFILTERED positive edges.
+
+    Same definition as the training filter (``Data/graph_dataset.py::_get_positive_samples``):
+    degree = how often a node appears as an endpoint of a (src, tgt, year) triple. The count has to
+    be taken BEFORE the min_degree edge filter, otherwise a node can drop below the threshold simply
+    because its own edges were removed, and the exclusion list would snowball.
+
+    Only called when data.exclude_low_degree_nodes asks for it, so the extra query is skipped
+    otherwise. Nodes that never appear are absent from the result (degree 0).
+    """
+    emb_name = getattr(full_dataset, 'embedding_name', 'embedding')
+    source_filter = getattr(full_dataset, 'source_filter', None)
+    source_clause = f" AND r.source = '{source_filter}'" if source_filter else ""
+    query = f"""
+        MATCH (c1:EntityObj)-[r:SupplyProductTo]->(c2:EntityObj)
+        WHERE c1.{emb_name} IS NOT NULL AND c2.{emb_name} IS NOT NULL
+        AND r.year IS NOT NULL AND r.year >= 2013 AND r.year <= 2025{source_clause}
+        RETURN id(c1) as source_id, id(c2) as target_id
+    """
+    node_mapping = full_dataset.node_mapping
+    degree: Dict[int, int] = {}
+    for record in full_dataset.neo4j_host.execute_query(query):
+        src = node_mapping.get(record['source_id'])
+        tgt = node_mapping.get(record['target_id'])
+        if src is not None:
+            degree[src] = degree.get(src, 0) + 1
+        if tgt is not None:
+            degree[tgt] = degree.get(tgt, 0) + 1
+    print(f"  [min_degree] endpoint hits: {sum(degree.values()):,}; "
+          f"nodes with degree > 0: {len(degree):,}/{len(node_mapping):,}")
+    return degree
+
+
+def check_prediction_interface(model: nn.Module) -> None:
+    """This script scores a batch as model(node_pairs, time_indices).
+
+    Temp-SEAL is the one backbone that does not fit: it needs k-hop subgraphs
+    (forward(data, link_indices, current_times)) and has no whole-graph scoring entry point,
+    so it must be rejected instead of being silently fed the wrong arguments.
+    """
+    try:
+        params = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):
+        return
+    positional = [p for p in params.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    required = [p for p in positional if p.default is p.empty]
+    if len(positional) < 2 or len(required) > 2:
+        raise RuntimeError(
+            f"{type(model).__name__}.forward expects "
+            f"{[p.name for p in inspect.signature(model.forward).parameters.values()]}, this script "
+            f"can only call forward(node_pairs, time_indices) (whole-graph scoring). "
+            f"Backbones that need per-link subgraphs (e.g. Temp-SEAL) are not supported here."
+        )
+
+
+def _newest_checkpoint(root: str, ckpt_name: str) -> Optional[str]:
+    """Newest <ckpt_name> at or below root (None when there is none)"""
+    if not root or not os.path.isdir(root):
         return None
-    results_dir = os.path.join(ROOT_DIR, 'results', output_subdir)
-    if not os.path.isdir(results_dir):
-        return None
-    best_path = os.path.join(results_dir, 'best_model.pth')
-    if os.path.exists(best_path):
-        return best_path
+    direct = os.path.join(root, ckpt_name)
+    if os.path.exists(direct):
+        return direct
     candidates = []
-    for root, dirs, files in os.walk(results_dir):
-        if 'best_model.pth' in files:
-            p = os.path.join(root, 'best_model.pth')
+    for dirpath, _dirnames, files in os.walk(root):
+        if ckpt_name in files:
+            p = os.path.join(dirpath, ckpt_name)
             candidates.append((os.path.getmtime(p), p))
-    if candidates:
-        candidates.sort(reverse=True)
-        return candidates[0][1]
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _find_checkpoint(cfg: dict, model_cfg: dict) -> Optional[str]:
+    """Resolve the weights: model.checkpoint > model.run_dir > results/<output_subdir>/**"""
+    impu_model_cfg = cfg.get('model', {}) or {}
+    explicit = impu_model_cfg.get('checkpoint', '') or ''
+    if explicit:
+        return explicit
+
+    ckpt_name = impu_model_cfg.get('checkpoint_name', 'best_model.pth')
+    run_dir = impu_model_cfg.get('run_dir', '') or ''
+    if run_dir:
+        if not os.path.isabs(run_dir):
+            run_dir = os.path.join(ROOT_DIR, 'results', run_dir)
+        found = _newest_checkpoint(run_dir, ckpt_name)
+        if found:
+            return found
+        print(f"[WARN] No {ckpt_name} below model.run_dir: {run_dir}")
+
+    output_subdir = cfg.get('output_subdir', '')
+    if output_subdir:
+        return _newest_checkpoint(os.path.join(ROOT_DIR, 'results', output_subdir), ckpt_name)
     return None
 
 
@@ -553,12 +731,18 @@ class ImputationPredictorFast:
         self.test_industry = impu_cfg.get('test_industry', 'example_industry')
         self.skip_existing = impu_cfg.get('skip_existing', True)
         self.year_range = data_cfg.get('year_range', list(range(2013, 2026)))
+        # min_degree was applied when the graph was built (see load_model); it is re-read here only
+        # so the predictor can report it and, when asked, drop low-degree nodes from the candidates.
+        self.min_degree = int(data_cfg.get('min_degree', 0) or 0)
+        self.exclude_low_degree_nodes = bool(data_cfg.get('exclude_low_degree_nodes', False))
 
         self.label_name = data_cfg.get('label_name', 'EntityObj')
         self.embedding_name = data_cfg.get('embedding_name', 'embedding')
         self.relation_name = output_cfg.get('relation_name', 'SupplyProductTo')
         self.output_source = output_cfg.get('source', 'imputation')
-        self.output_model = output_cfg.get('model_name', '') or cfg.get('name', 'Unknown')
+        self.output_model = (output_cfg.get('model_name', '')
+                             or cfg.get('name', '')
+                             or cfg.get('model_config_name', 'Unknown'))
 
         # Performance config
         self.num_writers = perf_cfg.get('num_writers', 1)
@@ -659,6 +843,33 @@ class ImputationPredictorFast:
         return result
 
 
+    def _filter_low_degree_companies(
+        self, industry_companies: Dict[str, List[int]]
+    ) -> Dict[str, List[int]]:
+        """Drop nodes whose degree < data.min_degree from the imputation candidate lists.
+
+        Degree uses the training definition (endpoint count over the UNFILTERED positives); a node
+        missing from the degree map has degree 0 and is dropped as well. Keeping only nodes that were
+        "visible enough" in the training graph avoids extrapolating the threshold to nodes the model
+        never really saw.
+        """
+        degrees = compute_node_degrees(self.full_dataset)
+        keep = {node for node, deg in degrees.items() if deg >= self.min_degree}
+
+        filtered: Dict[str, List[int]] = {}
+        total = 0
+        removed = 0
+        for industry, ids in industry_companies.items():
+            total += len(ids)
+            kept = [i for i in ids if i in keep]
+            removed += len(ids) - len(kept)
+            if kept:
+                filtered[industry] = kept
+        print(f"[min_degree] excluded {removed:,}/{total:,} company nodes with degree "
+              f"< {self.min_degree}")
+        print(f"  {len(keep):,} candidate nodes remain, {len(filtered)} industries still active")
+        return filtered
+
     def _query_existing_edges(
         self, upstream_neo4j_ids: List[int],
         downstream_neo4j_ids: List[int]
@@ -755,6 +966,9 @@ class ImputationPredictorFast:
         print(f"Batch size: {self.batch_size}")
         print(f"Prediction threshold: {self.threshold}")
         print(f"Skip existing: {self.skip_existing}")
+        print(f"Graph min_degree: {self.min_degree} (0 = every edge kept)")
+        print(f"Exclude low-degree nodes: {self.exclude_low_degree_nodes}"
+              f"{' (degree < ' + str(self.min_degree) + ')' if self.min_degree > 0 else ''}")
         print(f"Embedding precompute: {'enabled' if self._dynamic_embeddings is not None else 'disabled'}")
         print(f"Writer threads: {self.num_writers}")
         print(f"Batch write size: {self.flush_size}")
@@ -763,6 +977,11 @@ class ImputationPredictorFast:
         reverse_mapping = self.full_dataset.reverse_node_mapping
 
         industry_companies = self._get_all_industry_companies(indus_network)
+        if self.exclude_low_degree_nodes and self.min_degree > 0:
+            industry_companies = self._filter_low_degree_companies(industry_companies)
+        elif self.exclude_low_degree_nodes:
+            print("[WARN] data.exclude_low_degree_nodes=true but data.min_degree <= 0: "
+                  "nothing to exclude (set data.min_degree > 0)")
 
         total_estimate, _ = self.estimate_total_pairs(indus_network, industry_companies)
 
@@ -888,12 +1107,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Temporal GNN edge imputation prediction [high-performance version] - batch writes + async pipeline + multi-threading'
     )
-    parser.add_argument('--config', '-c', default='gatgru_vec',
-                        help='model config name')
+    parser.add_argument('--config', '-c', default=None,
+                        help='model config name; overrides model.config_name in imputation_common.yaml')
     parser.add_argument('--checkpoint', '-p', default='',
-                        help='model checkpoint path')
+                        help='model checkpoint path; overrides model.checkpoint in imputation_common.yaml')
     parser.add_argument('--device', '-d', default='auto',
-                        help='device (auto/cuda/cpu)')
+                        help='device (auto/cuda/cpu); falls back to model.device in imputation_common.yaml')
     parser.add_argument('--indus-network', default='',
                         help='industry network JSON file path')
     parser.add_argument('--threshold', type=float, default=None,
@@ -910,6 +1129,17 @@ def main():
                         help='industry name to process in test mode')
     parser.add_argument('--no-skip-existing', action='store_true',
                         help='do not skip existing edges')
+    parser.add_argument('--min-degree', type=int, default=None,
+                        help='minimum node degree used to build the inference graph '
+                             '(overrides data.min_degree; 0 = keep every edge)')
+    parser.add_argument('--exclude-low-degree-nodes', dest='exclude_low_degree_nodes',
+                        action='store_true', default=None,
+                        help='exclude nodes with degree < min_degree from the imputation candidates '
+                             '(overrides data.exclude_low_degree_nodes)')
+    parser.add_argument('--keep-low-degree-nodes', dest='exclude_low_degree_nodes',
+                        action='store_false', default=None,
+                        help='keep every embedded node as a candidate '
+                             '(overrides data.exclude_low_degree_nodes)')
     parser.add_argument('--num-writers', type=int, default=None,
                         help='number of writer threads (default 4)')
     parser.add_argument('--flush-size', type=int, default=None,
@@ -924,7 +1154,13 @@ def main():
     print("=" * 60)
 
     cfg = load_imputation_config(args.config)
-    device_str = resolve_device(args.device)
+    model_config_name = cfg['model_config_name']
+
+    # Device: CLI > model.device in imputation_common.yaml > auto
+    device_str = resolve_device(
+        args.device if args.device != 'auto'
+        else (cfg.get('model', {}) or {}).get('device', 'auto')
+    )
     device = torch.device(device_str)
 
     # Command-line argument overrides
@@ -942,6 +1178,10 @@ def main():
         cfg.setdefault('prediction', {})['test_industry'] = args.test_industry
     if args.no_skip_existing:
         cfg.setdefault('prediction', {})['skip_existing'] = False
+    if args.min_degree is not None:
+        cfg.setdefault('data', {})['min_degree'] = args.min_degree
+    if args.exclude_low_degree_nodes is not None:
+        cfg.setdefault('data', {})['exclude_low_degree_nodes'] = args.exclude_low_degree_nodes
     if args.no_cache:
         cfg.setdefault('embedding_cache', {})['enabled'] = False
     if args.force_recompute:
@@ -960,22 +1200,63 @@ def main():
     impu_pred_cfg = cfg.get('prediction', {})
     perf_cfg_final = cfg.get('performance', {})
 
-    print(f"Model config: {args.config}")
+    # Per-model threshold: score scales are not comparable across backbones, so an entry in
+    # prediction.threshold_by_model wins; the CLI value (applied above) always wins over both.
+    if args.threshold is None:
+        by_model = impu_pred_cfg.get('threshold_by_model') or {}
+        if model_config_name in by_model:
+            impu_pred_cfg['threshold'] = float(by_model[model_config_name])
+            threshold_source = f"prediction.threshold_by_model[{model_config_name}]"
+        else:
+            threshold_source = (f"prediction.threshold (no threshold_by_model entry for "
+                                f"'{model_config_name}')")
+            print(f"[WARN] Score scales are not comparable across backbones: fill "
+                  f"prediction.threshold_by_model['{model_config_name}'] (Youden's J / F1-max from "
+                  f"Prediction/find_threshold*.py) for this model before writing to Neo4j.")
+    else:
+        threshold_source = "--threshold"
+
+    print(f"Model config: {model_config_name}"
+          f"{' (from imputation_common.yaml)' if not args.config else ' (from --config)'}")
     print(f"Model class:  {model_cfg.get('class', 'N/A')}")
+    print(f"Checkpoint:   {model_cfg.get('checkpoint') or model_cfg.get('run_dir') or 'auto-search'}")
     print(f"Device:       {device}")
-    print(f"Threshold:    {impu_pred_cfg.get('threshold', 0.5)}")
+    print(f"Threshold:    {impu_pred_cfg.get('threshold', 0.5)}  <- {threshold_source}")
     print(f"Writers:      {perf_cfg_final.get('num_writers', 4)}")
     print(f"Batch write:  {perf_cfg_final.get('flush_size', 500)} rows/write")
     if impu_pred_cfg.get('test_mode'):
         print(f"Test mode: processing only '{impu_pred_cfg.get('test_industry', 'example_industry')}'")
+    impu_data_cfg = cfg.get('data', {})
+    min_degree = int(impu_data_cfg.get('min_degree', 0) or 0)
+    print(f"Graph min_degree: {min_degree}"
+          f"{' (training-like edge filter)' if min_degree > 0 else ' (keep every edge)'}")
+    exclude_low = bool(impu_data_cfg.get('exclude_low_degree_nodes', False))
+    if min_degree > 0:
+        print(f"Exclude low-degree candidates: {exclude_low}"
+              f"{' (degree < ' + str(min_degree) + ')' if exclude_low else ''}")
+    elif exclude_low:
+        print("[WARN] data.exclude_low_degree_nodes=true but data.min_degree <= 0: ignored, "
+              "no node is excluded")
 
     # 1. Load model and data
     model, model_info, full_dataset, dynamic_data = load_model(cfg, device)
 
     # 2. Embedding precomputation
     cache_enabled = cfg.get('embedding_cache', {}).get('enabled', True)
+    ckpt_path = model_info['checkpoint_path']
+    cache_meta = {
+        'model_config': model_config_name,
+        'model_class': f"{model_cfg.get('module', '')}.{model_cfg.get('class', '')}",
+        'checkpoint': os.path.abspath(ckpt_path),
+        'checkpoint_mtime': round(os.path.getmtime(ckpt_path), 3) if os.path.exists(ckpt_path) else None,
+        'num_nodes': model_info['num_nodes'],
+        'time_steps': [int(t) for t in model_info['time_steps']],
+        # The graph is sparser when min_degree > 0, so the cached embeddings are no longer valid
+        # for another min_degree even with the same checkpoint and node count.
+        'min_degree': model_info.get('min_degree', 0),
+    }
     embedding_cache = EmbeddingCache(
-        model, model_info['year_to_idx'], len(model_info['time_steps'])
+        model, model_info['year_to_idx'], len(model_info['time_steps']), meta=cache_meta
     )
 
     if cache_enabled and embedding_cache.is_compatible():

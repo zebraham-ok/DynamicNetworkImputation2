@@ -2,9 +2,10 @@
 """
 PrROC2_fff: Draw a single-model ROC curve from GAT-GRU[fff] test-set predictions.
 Data source: model_predictions_best_auc.npy of some fff-config run (test-set predictions
-        of the best-AUC checkpoint). By default the latest one under results/gatgru/*fff*/
+        of the best-AUC checkpoint). By default the latest one under <results-root>/gatgru/*fff*/
         is selected automatically; the run directory can also be specified via the
-        IMPUT_FFF_RUN environment variable (relative to the repo root or absolute).
+        IMPUT_FFF_RUN environment variable (relative to the repo root or absolute), and the
+        results root via IMPUT_RESULTS_DIR (needed when results/ is foldered, e.g. results/单次4模式).
 Output: Analysis/npy_roc_output/fig_roc_gatgru_fff.png
       Analysis/npy_roc_output/roc_curve_gatgru_fff.csv
 """
@@ -18,6 +19,10 @@ from sklearn.metrics import roc_curve, auc
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+# Results root: IMPUT_RESULTS_DIR (absolute or relative to the repo root) or <repo>/results
+_RESULTS_ROOT = os.environ.get('IMPUT_RESULTS_DIR') or os.path.join(_PROJECT_ROOT, 'results')
+if not os.path.isabs(_RESULTS_ROOT):
+    _RESULTS_ROOT = os.path.join(_PROJECT_ROOT, _RESULTS_ROOT)
 
 def _resolve_npy_file():
     run = os.environ.get('IMPUT_FFF_RUN')
@@ -25,7 +30,7 @@ def _resolve_npy_file():
         base = run if os.path.isabs(run) else os.path.join(_PROJECT_ROOT, run)
         return os.path.join(base, 'model_predictions_best_auc.npy')
     import glob
-    pattern = os.path.join(_PROJECT_ROOT, 'results', 'gatgru', '*fff*',
+    pattern = os.path.join(_RESULTS_ROOT, 'gatgru', '*fff*',
                            'model_predictions_best_auc.npy')
     candidates = sorted(glob.glob(pattern))
     if not candidates:

@@ -1,0 +1,45 @@
+# ============================================================
+# GAT-GRU-Vec with num_rnn_layers = 2 (the "GAT-GRU*" / GAT-GRU-LS backbone)
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# Same module/class as gatgru_vec; the ONLY architectural difference is the second BiGRU layer.
+# Training runs that used this backbone (all under results/四次双模式/ensemble/):
+#   gatgru2layer/sampling_0913-0911         -> GAT-GRU*   (2 layers)
+#   gatgru2layer-smooth/sampling_0913-1951  -> GAT-GRU-LS (2 layers + trainer label_smoothing 0.1)
+# Loading one of their checkpoints with the 1-layer gatgru_vec config fails under model.strict=true
+# with skipped=8 / missing=0: the 8 tensors of the second (reverse-aware) BiGRU layer
+# (weight_ih_l1 / weight_hh_l1 / bias_ih_l1 / bias_hh_l1, plus the _reverse copies) have nowhere
+# to go, while every parameter of the 1-layer model is still filled (hence missing=0).
+# ============================================================
+
+name: GAT-GRU*-Vec
+output_subdir: gatgru_2layer
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 2
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

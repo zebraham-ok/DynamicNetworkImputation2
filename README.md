@@ -154,7 +154,37 @@ python Analysis/plot_train_4metrics.py     # training figure used in the paper
 python Analysis/edge_imput_overlap_scan.py # threshold sweep vs. observed edges (queries Neo4j)
 python Analysis/edge_imput_overlap_plot.py # overlap-vs-threshold curve (reads the sweep JSON)
 python Analysis/seed_ci_summary.py         # across-seed mean ± 95% CI, from summary.yaml
+python Analysis/seed_ci_figures.py         # per-seed ROC + mean curve with a 95% CI band
 ```
+
+Which models appear in the figures, and under which name, is decided by one file per results
+root — `model_plot_config.json` (see `results/四次双模式/model_plot_config.json`):
+
+```jsonc
+{ "models": [
+    { "key": "egcn", "name": "EvolveGCN-H" },
+ // { "key": "tna",  "name": "BiTNA" },        <- comment out one line to drop the model
+]}
+```
+
+Commenting out a line (or `"include": false`) removes that model from *every* figure, since
+`visualize_results.py`, `plot_train_4metrics.py`, `seed_ci_summary.py`, `seed_ci_figures.py`
+and `PrROC_all_models*.py` all read the list through `Analysis/plot_models.py`; the list order
+is also the legend and colour order. Directories on disk that are not listed are skipped. The
+file is found next to `--results-dir` or one level above it; `--model-config PATH` overrides it.
+With no such file nothing is filtered, i.e. the pre-config behaviour.
+
+Adding a model that has just been uploaded takes two commands — unpack the archive into the
+`ensemble/` tree and flatten it into the `confidence/` tree that the line-figure scripts read:
+
+```bash
+python Analysis/prepare_confidence_runs.py gatgru2layer-smooth \
+       --zip "results/四次双模式/gatgru2layer-smooth-0913-1951.zip"
+# then add one { "key": ..., "name": ... } line to model_plot_config.json and re-run the figures
+```
+
+`prepare_confidence_runs.py` is idempotent (re-running only refreshes the flattened copies) and
+ignores the `.ipynb_checkpoints/` folders that some uploads carry.
 
 Seed ensembles (several runs of the same model and sampling flag) are aggregated on two
 levels: `Analysis/visualize_results.py --multi-run confidence` keeps every run and draws
@@ -180,6 +210,7 @@ the defaults:
 | `IMPUT_FFF_RUN`       | `PrROC2_fff.py`                                              | Run directory holding`model_predictions_best_auc.npy`                                                               |
 | `IMPUT_FIG_DIR`       | `plot_train_4metrics.py`                                     | Output directory for the training figure (default`Analysis/figures/`; `--out-dir DIR` also works)                 |
 | `IMPUT_SEAL_FFF_RUN`  | `plot_train_4metrics.py`                                     | Temp-SEAL[fff] run to plot, overriding the default (earlier runs used a sliding-window loss average and are excluded) |
+| `IMPUT_MODEL_CONFIG` | `visualize_results.py`, `plot_train_4metrics.py`, `seed_ci_summary.py`, `seed_ci_figures.py`, `PrROC_all_models*.py` | Path of the `model_plot_config.json` deciding which models are drawn and how they are named (`--model-config` also works) |
 
 The sweep tolerates a missing `threshold_results.json`: the curves are still produced, only
 the annotated key thresholds are skipped. Likewise, `plot_train_4metrics.py` is the only

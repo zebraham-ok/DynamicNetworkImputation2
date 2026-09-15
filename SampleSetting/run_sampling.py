@@ -214,6 +214,10 @@ def run_single_training(
         # Ranking-loss margin, config key trainer.kwargs.margin (default 1.0 = old behaviour);
         # keep it < 1.0 because the Sigmoid head caps the achievable score gap at 1.0.
         margin=trainer_kwargs.get('margin', 1.0),
+        # Label smoothing of the BCE term, config key trainer.kwargs.label_smoothing
+        # (absent / 0 = off = historical hard labels); the calibration lever for the threshold
+        # drift described in TechnicalGuide.md 5.1.
+        label_smoothing=trainer_kwargs.get('label_smoothing', 0.0),
         factset_edges=factset_edges,
         node_mapping=node_mapping,
         reverse_node_mapping=reverse_node_mapping,
@@ -938,8 +942,9 @@ def main():
     print(f"  Effective trainer: num_epochs={trainer_cfg.get('num_epochs')}, "
           f"max_factset_edges={trainer_cfg.get('max_factset_edges')}, "
           f"margin_lambda={trainer_cfg.get('kwargs', {}).get('margin_lambda')}, "
-          f"margin={trainer_cfg.get('kwargs', {}).get('margin', 1.0)}"
-          f" (ranking-loss gap demanded of scores in [0, 1])")
+          f"margin={trainer_cfg.get('kwargs', {}).get('margin', 1.0)}, "
+          f"label_smoothing={trainer_cfg.get('kwargs', {}).get('label_smoothing', 0.0) or 0.0}"
+          f" (ranking-loss gap demanded of scores in [0, 1]; label_smoothing 0 = hard labels)")
     sel_cfg = trainer_cfg.get('selection') or {}
     lr_cfg = trainer_cfg.get('lr_schedule') or {}
     early_stop_patience = sel_cfg.get('patience') or EARLY_STOP_PATIENCE_DEFAULT
@@ -976,7 +981,9 @@ def main():
         # the protocol just like `selection`/`lr_schedule`: runs trained with a different margin
         # are not comparable, so the effective values must be visible in the summary metadata.
         'loss': {'margin_lambda': (trainer_cfg.get('kwargs') or {}).get('margin_lambda', 0.1),
-                 'margin': (trainer_cfg.get('kwargs') or {}).get('margin', 1.0)},
+                 'margin': (trainer_cfg.get('kwargs') or {}).get('margin', 1.0),
+                 'label_smoothing':
+                     (trainer_cfg.get('kwargs') or {}).get('label_smoothing', 0.0) or 0.0},
         'repeats': repeats,
         'seeds': list(seeds),
     }

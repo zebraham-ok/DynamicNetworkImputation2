@@ -100,6 +100,18 @@ trainer:
     # Values such as 0.25 keep it a genuine ranking constraint; 1.0 = historical behaviour.
     margin: 0.5
 
+    # Label smoothing of the BCE term: y' = y * (1 - eps) + (1 - y) * eps.
+    # ABSENT OR 0 = OFF (hard labels, the historical behaviour): leaving the key out is the same as
+    # writing 0.0, so existing configs keep reproducing their numbers bit-for-bit.
+    # Enabling it (0.05 / 0.1 are the useful range) caps the logit scale: the BCE optimum moves from
+    # "as saturated as possible" to the finite logit log((1 - eps) / eps) (0.05 -> 2.94, 0.1 -> 2.20),
+    # which is what stops the score tails from drifting and pulls the Youden threshold away from
+    # ~0.99 (see TechnicalGuide.md 5.1). The ranking loss is NOT smoothed, so with margin > 1 - 2*eps
+    # the hinge keeps pushing pairs towards the saturation corners and defeats part of the effect:
+    # lower `margin` to at most 1 - 2*eps (e.g. <= 0.9 for eps = 0.05). The trainer warns when the
+    # two are not in step.
+    label_smoothing: 0.0
+
 # --- Pretrained model loading ---
 # If a pretrained model path is provided, its feature extractor (static_encoder/static_gnn)
 # is loaded and frozen, while the remaining modules (temporal_encoder/edge_predictor) are retrained

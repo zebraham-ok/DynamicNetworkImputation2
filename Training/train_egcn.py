@@ -97,6 +97,9 @@ if __name__ == "__main__":
         # Ranking-loss margin, config key trainer.kwargs.margin (default 1.0 = old behaviour);
         # keep it < 1.0 because the Sigmoid head caps the achievable score gap at 1.0.
         margin=trainer_cfg.get('kwargs', {}).get('margin', 1.0),
+        # Label smoothing of the BCE term, config key trainer.kwargs.label_smoothing
+        # (absent / 0 = off = historical hard labels); see TechnicalGuide.md 5.1.
+        label_smoothing=trainer_cfg.get('kwargs', {}).get('label_smoothing', 0.0),
         factset_edges=factset_edges,
         node_mapping=node_mapping,
         reverse_node_mapping=reverse_node_mapping,

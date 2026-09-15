@@ -11,10 +11,69 @@ data:
   rel_condition: "{source: 'semi'}"    # relation filter condition (semi filter when building the graph)
   year_range: [2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
   source_filter: semi                  # data source filter
+  # Optional: pin the time-step axis explicitly (years -> index). Leave empty to infer it from the
+  # graph + year_range, exactly as the training scripts do. ONLY set it if the training run used a
+  # different axis, otherwise the year->embedding index mapping silently shifts.
+  time_steps: []                       # e.g. [2013, 2014, ..., 2025]
+  # Minimum node degree used when building the inference graph (0 = keep every edge, the historical
+  # default). Same rule as Training/common_config.yaml dataset.min_degree: degree = how often a node
+  # appears as an endpoint of a (src, tgt, year) positive; an edge survives only when BOTH endpoints
+  # reach the threshold. It filters EDGES, so it changes the graph the dynamic embeddings are
+  # computed on - node ids / num_nodes stay identical (they come from the embedding table), so the
+  # checkpoint still loads. 2 reproduces the training graph.
+  min_degree: 0
+  # Whether to drop nodes with degree < min_degree from the imputation candidate lists.
+  #   false (default) = every node with an embedding stays a candidate (historical behaviour), which
+  #                     means degree-0/1 nodes that are invisible in the training graph get scored;
+  #   true            = only score nodes that were "visible enough" in the training graph, so the
+  #                     threshold is not extrapolated to unseen low-degree nodes.
+  # No effect when min_degree <= 0 (a warning is printed). Degree is counted on the UNFILTERED
+  # positives, otherwise a node could fall below the threshold just because its edges were removed.
+  exclude_low_degree_nodes: false
 
 # --- Prediction ---
 prediction:
   threshold: 0.452                     # prediction probability threshold, above this value is saved to Neo4j
+  # Per-model thresholds (key = the model config name, i.e. model.config_name below).
+  # Score scales are NOT comparable across backbones (GAT-GRU Youden ~0.98, EGCN ~0.3), so a model
+  # MUST have its own entry here; otherwise the global `threshold` above is used and a warning is
+  # printed. Fill it from Prediction/find_threshold*.py (youden_j / f1_max).
+  threshold_by_model:
+    # All values below: Youden's-J threshold of the ftf (Intra-Indus) run with the highest
+    # test AUC among ALL 8 ftf runs of that config (4 seeds x {frozen, scratch}, and every
+    # variant directory sharing the same model.config_name — see the per-key notes).
+    #   CURRENT choice: GAT-GRU-LS (label smoothing) — best-calibrated of the three variants.
+    gatgru_vec: 0.688                  # GAT-GRU-LS, ftf, seed43, AUC 0.9220
+    #   Same number under the `gatgru_2layer` key below (that config is what actually loads the
+    #   2-layer ckpt — see model.config_name).
+    #   ckpt: results/四次双模式/ensemble/gatgru2layer-smooth/sampling_0913-1951/seed43/0_ftf_frozen/best_auc_model.pth
+    #   (also in gatgru2layer-smooth-0913-1951.zip; this one is already unzipped locally)
+    #   Youden = 0.6880, F1-max = 0.6680 (the two nearly coincide -> the score is well calibrated)
+    #   Alternatives (each needs its own ckpt — do NOT mix thresholds across them):
+    #     GAT-GRU* 2L (gatgru2layer/0913-0911/seed43/0_ftf_frozen) AUC 0.9322 -> Youden 0.7983
+    #        (highest AUC, but Youden 0.798 vs F1-max 0.670 disagree; ckpt only in
+    #         results/四次双模式/gatgru2layer-0913-0911.zip :: sampling_0913-0911/seed43/0_ftf_frozen/best_auc_model.pth)
+    #     GAT-GRU 1L  (gatgru/0912-1636/seed43/0_ftf_frozen)       AUC 0.9033 -> Youden 0.8108
+    # GAT-GRU-LS is a 2-layer backbone, so it must be loaded with config `gatgru_2layer`
+    # (Models/configs/gatgru_2layer.yaml, num_rnn_layers: 2), NOT with the 1-layer `gatgru_vec`.
+    gatgru_2layer: 0.688                # = gatgru_vec above: GAT-GRU-LS, ftf, seed43, AUC 0.9220
+    # gatgru_1dire: 0.000              # GAT-GRU-1Dir — no run under 四次双模式
+    bigru_vec: 0.374                   # BiGRU-Vec, ftf, seed43, AUC 0.8153 (best of the 8 ftf runs)
+    #   pth: results/四次双模式/ensemble/bigru/sampling_0912-1919/seed43/0_ftf_frozen/best_auc_model.pth   (unzip bigru-0912-1919.zip first)
+    #   Youden = 0.3740 (F1-max 0.3740)
+    egcn: 0.345                        # EvolveGCN-H, ftf, seed45, AUC 0.9505 (best of the 8 ftf runs)
+    #   pth: results/四次双模式/ensemble/egcn/sampling_0912-1646/seed45/0_ftf_frozen/best_auc_model.pth
+    #   Youden = 0.3446 (J 0.8012); F1-max of the same run = 0.3310 (the old 0.331 was that point).
+    #   Label-smoothing variant (egcn-smooth) peaks at seed45, AUC 0.9470 -> Youden 0.3940.
+    #   Do NOT reuse 0.452 here — that is the GAT-GRU scale, not this model's.
+    tna_vec: 0.349                     # BiTNA-Vec, ftf, seed45, AUC 0.8034 (best of the 8 ftf runs)
+    #   pth: results/四次双模式/ensemble/tna/sampling_0912-1844/seed45/0_ftf_frozen/best_auc_model.pth   (unzip tna-0912-1844.zip first)
+    #   Youden = 0.3488 (F1-max 0.3490)
+    fusion_film: 0.868                 # GAT-GRU-FiLM (fusion1layer), ftf, seed45, AUC 0.9014
+    #   pth: results/四次双模式/ensemble/fusion1layer/sampling_0912-1621/seed45/0_ftf_frozen/best_auc_model.pth   (unzip fusion1layer-0912-1621.zip)
+    #   Youden = 0.8676 (F1-max 0.8680); fusion2layer (= fusion_film with 2 RNN layers) peaks at
+    #   seed44 scratch, AUC 0.8955 -> Youden 0.7967: results/四次双模式/ensemble/fusion2layer/sampling_0912-1936/seed44/0_ftf_scratch/best_auc_model.pth
+    # fusion_temporal_injection: 0.000 # GAT-GRU-TI — no run under 四次双模式
   batch_size: 512                      # batch size for batched inference
   test_mode: false                     # test mode: true=process only one industry
   test_industry: "example_industry"  # must match a key in indus_network.json; used only in test mode
@@ -25,8 +84,29 @@ indus_network:
   path: info/indus_network.json        # industry upstream/downstream dependency file path (relative to project root)
 
 # --- Model ---
+# WHICH trained backbone to load. Resolution order for the config name:
+#   CLI --config  >  model.config_name  >  'gatgru_vec'
+# Resolution order for the weights:
+#   model.checkpoint  >  model.run_dir  >  results/<output_subdir>/**/best_model.pth
 model:
-  checkpoint: ""                       # model checkpoint path (if empty, auto-search results/ for best_model.pth)
+  config_name: egcn                    # Models/configs/<config_name>.yaml (gatgru_vec | gatgru_2layer |
+                                       # gatgru_1dire | bigru_vec | egcn | tna_vec | fusion_film |
+                                       # fusion_temporal_injection | seal)
+                                       # gatgru_2layer = the same GAT-GRU class with num_rnn_layers: 2;
+                                       # use it for the gatgru2layer / gatgru2layer-smooth (GAT-GRU-LS)
+                                       # checkpoints, otherwise strict=true fails with skipped=8.
+                                       # NOTE: egcn-smooth is the SAME config (egcn) + trainer LS, so
+                                       # both variants resolve to this key (also used by threshold_by_model).
+  checkpoint: results/egcn/best_auc_model_seed45.pth
+                                       # explicit .pth path (absolute, or relative to the project root
+                                       # = the opensource-revise directory). Highest priority, so
+                                       # run_dir / auto-search below are skipped.
+  run_dir: ""                          # training output dir (relative to results/, or absolute);
+                                       # the newest best_model.pth below it wins. -s of run_sampling.py
+                                       # e.g. "四次双模式/gatgru2layer" or "单次4模式/gatgru/0911-2029-fff"
+  checkpoint_name: best_model.pth      # file name searched for inside run_dir / results/<output_subdir>
+  strict: true                         # true = fail when the checkpoint and the architecture disagree
+                                       # (recommended the first time you switch to a new backbone)
   device: auto                         # device (auto/cuda/cpu)
 
 # --- Embedding precomputation ---
@@ -38,7 +118,10 @@ embedding_cache:
 # --- Neo4j output ---
 output:
   source: imputation                   # source property value of the imputed edge
-  model_name: ""                       # model property value of the imputed edge (if empty, uses the model config name)
+  # Written edges are MERGEd on {year, probability, source, model}, so a different model name
+  # (or a different score) creates a PARALLEL edge instead of overwriting the old imputation.
+  # Keep distinct, greppable names so each imputation run can be told apart / deleted later.
+  model_name: "gat-gru-smooth"           # model property value of the imputed edge (if empty, uses the model config name)
   relation_name: SupplyProductTo       # output edge relation type
 
 # --- Performance tuning (used only by get_imputation_fast.py) ---

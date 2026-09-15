@@ -21,7 +21,7 @@ grouped by the mode itself ('0_ftt') instead, exactly like the 'by_mode' block o
 summary.yaml; the role of every single run stays visible in the 'role' column of seed_metrics.csv.
 Without rotation the full mode key is kept, because scratch and frozen runs are different regimes.
 
-Outputs (default Analysis/visualization/seed_ci/):
+Outputs (default Analysis/npy_roc_output_ci/):
     seed_metrics.csv   long format: model, run, seed, role, mode, rotate_donor, metric, value
     seed_summary.csv   mean / std / 95% CI half-width / n per (model, run, mode, metric)
     seed_summary.md    human-readable table, one block per model and mode
@@ -29,11 +29,12 @@ Outputs (default Analysis/visualization/seed_ci/):
 
 Usage:
     python Analysis/seed_ci_summary.py
-    python Analysis/seed_ci_summary.py --results-dir results --out-dir Analysis/visualization/seed_ci
+    python Analysis/seed_ci_summary.py --results-dir results --out-dir Analysis/npy_roc_output_ci
     python Analysis/seed_ci_summary.py --metrics test_auc test_f1 test_loss --fig-metrics test_auc test_f1
 """
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,8 @@ import yaml
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+sys.path.insert(0, _SCRIPT_DIR)
+import plot_models  # noqa: E402  (same directory; stdlib-only)
 
 # Same two-sided 95% t quantiles as visualize_results.py::_T95_TABLE (small-sample seed ensembles)
 _T95_TABLE = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
@@ -268,8 +271,12 @@ def write_markdown(summary_df, path, metrics):
     Path(path).write_text('\n'.join(lines), encoding='utf-8')
 
 
-def plot_bars(summary_df, path, fig_metrics):
-    """Grouped bar chart: one bar per (model, mode), error bar = 95% CI across seeds."""
+def plot_bars(summary_df, path, fig_metrics, labels=None):
+    """Grouped bar chart: one bar per (model, mode), error bar = 95% CI across seeds.
+
+    `labels` is the ordered model -> display-name mapping of the plot config; its key order drives
+    the bar/colour order and its values the legend text. Without it the directory names are used.
+    """
     if summary_df.empty:
         return
     import matplotlib
@@ -281,8 +288,11 @@ def plot_bars(summary_df, path, fig_metrics):
         print("  [WARN] none of the requested figure metrics are present; skipping the bar chart")
         return
 
+    labels = labels or {}
     modes = list(dict.fromkeys(summary_df['mode']))
-    models = list(dict.fromkeys(summary_df['model']))
+    present = set(summary_df['model'])
+    models = [m for m in labels if m in present] if labels else list(dict.fromkeys(summary_df['model']))
+    models += [m for m in dict.fromkeys(summary_df['model']) if m not in models]
     cmap = plt.get_cmap('tab10')
     fig, axes = plt.subplots(1, len(fig_metrics), figsize=(4.6 * len(fig_metrics), 4.4), squeeze=False)
 
@@ -303,7 +313,7 @@ def plot_bars(summary_df, path, fig_metrics):
                 errs.append(row['ci95'] if np.isfinite(row['ci95']) else 0.0)
             if xs:
                 ax.bar(xs, ys, width=width, yerr=errs, capsize=3,
-                       color=cmap(m_idx % 10), alpha=0.85, label=model,
+                       color=cmap(m_idx % 10), alpha=0.85, label=labels.get(model, model),
                        error_kw={'linewidth': 1.0, 'ecolor': 'dimgray'})
         ax.set_xticks([i + 0.4 - width / 2 for i in range(len(modes))])
         ax.set_xticklabels([mode_display(m) for m in modes], fontsize=9)
@@ -326,13 +336,16 @@ def parse_args():
     parser.add_argument('--results-dir', default=os.path.join(_REPO_ROOT, 'results'),
                         help='directory holding <model>/sampling_*/[seed*]/summary.yaml '
                              '(default: opensource-revise/results)')
-    parser.add_argument('--out-dir', default=os.path.join(_SCRIPT_DIR, 'visualization', 'seed_ci'),
-                        help='output directory (default: Analysis/visualization/seed_ci)')
+    parser.add_argument('--out-dir', default=os.path.join(_SCRIPT_DIR, 'npy_roc_output_ci'),
+                        help='output directory (default: Analysis/npy_roc_output_ci)')
     parser.add_argument('--metrics', nargs='+', default=DEFAULT_METRICS,
                         help='metrics to tabulate (must exist in summary.yaml)')
     parser.add_argument('--fig-metrics', nargs='+', default=['test_auc', 'test_f1'],
                         help='metrics to draw in the bar chart')
     parser.add_argument('--no-figure', action='store_true', help='skip the bar chart')
+    parser.add_argument('--model-config', default=None,
+                        help='plot list deciding which models are aggregated / how they are named '
+                             f'(default: {plot_models.CONFIG_NAME} next to the results root)')
     return parser.parse_args()
 
 
@@ -349,6 +362,17 @@ def main():
         print("  [ERROR] no summary.yaml found under results/<model>/sampling_*/ — "
               "run SampleSetting/run_sampling.py first")
         return
+
+    # Same plot list as the other figures: comment a line there and the model leaves the CSVs, the
+    # markdown table, the console digest and the bar chart. Its order drives the bar colours.
+    cfg = plot_models.load_plot_models(args.results_dir, args.model_config)
+    labels = {}
+    if cfg is not None:
+        labels = cfg.mapping(available={e['model'] for e in entries})
+        entries = [e for e in entries if e['model'] in labels]
+        if not entries:
+            print("  [ERROR] the plot config selects no model present in this tree")
+            return
 
     runs = {(e['model'], e['run']) for e in entries}
     seeds_per_run = {}
@@ -385,7 +409,8 @@ def main():
     print(f"  Markdown table                : {md_path}")
 
     if not args.no_figure:
-        plot_bars(summary_df, os.path.join(args.out_dir, 'seed_ci_bars.png'), args.fig_metrics)
+        plot_bars(summary_df, os.path.join(args.out_dir, 'seed_ci_bars.png'), args.fig_metrics,
+                  labels=labels)
 
     # Console digest: one line per (model, run root, mode) for the headline metrics
     print(f"\n  {'Model':<10} {'Mode':<16} {'Test AUC':<20} {'Test F1':<20} "

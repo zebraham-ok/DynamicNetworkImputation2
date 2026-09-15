@@ -17,11 +17,19 @@ enters the criterion when selection.use_factset is true. The learning rate is co
 lr_schedule.enabled is set (see DEFAULT_LR_SCHEDULE_CFG). Both blocks default to the historical
 behaviour, so entry points that pass nothing keep reproducing the old protocol.
 
+The training objective is BCE + margin_lambda * MarginRankingLoss. The BCE term takes an optional
+label smoothing (constructor argument `label_smoothing`, config key trainer.kwargs.label_smoothing,
+default 0.0 = off): the targets become y' = y * (1 - eps) + (1 - y) * eps, which moves the loss
+optimum to a FINITE logit, log((1 - eps) / eps). Hard-label BCE has no such optimum, so on a
+near-separable training set it keeps inflating the logit scale and drifts the Youden threshold
+towards 1.0; label smoothing is the calibration lever for exactly that (TechnicalGuide.md 5.1).
+
 Usage:
     trainer = DynamicGraphTrainer(
         model=model, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
         factset_edges=factset_edges,  # optional: [(src, tgt, year), ...] for the factset quantile metric
         margin_lambda=0.1,            # Margin Ranking Loss weight
+        label_smoothing=0.0,          # optional: 0 / unset = hard labels (see below)
         static_data=static_data,      # only for backbones whose forward takes the static graph (Temp-SEAL)
         selection_cfg=...,            # optional: {'use_factset': False, 'metric': 'auc', 'ema_span': 5,
                                       #            'patience': 15}  (trainer.selection in the YAML config)
@@ -107,11 +115,30 @@ def _forward_takes_static_graph(model) -> bool:
             and first.kind in (first.POSITIONAL_ONLY, first.POSITIONAL_OR_KEYWORD))
 
 
+def _resolve_label_smoothing(value) -> float:
+    """Validate the BCE label-smoothing factor (config key trainer.kwargs.label_smoothing).
+
+    A missing key / None / 0 all mean "off" (hard labels, the historical behaviour). The factor must
+    lie in [0, 0.5): at 0.5 both classes receive the target 0.5 and the BCE term carries no class
+    information at all. A typo therefore fails fast at construction time instead of silently
+    training something else.
+    """
+    if value is None:
+        return 0.0
+    eps = float(value)
+    if not 0.0 <= eps < 0.5:
+        raise ValueError(
+            f"label_smoothing must be in [0, 0.5) (0 = off), got {value!r}: at 0.5 every target "
+            f"becomes 0.5 and the BCE term carries no class information."
+        )
+    return eps
+
+
 class DynamicGraphTrainer:
     def __init__(self, model, train_loader, test_loader, val_loader=None,
                  device='cuda' if torch.cuda.is_available() else 'cpu',
                  log_dir=None, use_tensorboard=True,
-                 margin_lambda=0.1, margin=1.0, factset_edges=None,
+                 margin_lambda=0.1, margin=1.0, label_smoothing=0.0, factset_edges=None,
                  node_mapping=None, reverse_node_mapping=None,
                  static_data=None, selection_cfg=None, lr_schedule_cfg=None,
                  save_test_predictions=True):
@@ -172,6 +199,21 @@ class DynamicGraphTrainer:
         self.margin = float(margin)
         self.margin_loss = nn.MarginRankingLoss(margin=self.margin)
         self.margin_lambda = margin_lambda
+
+        # Label smoothing of the BCE term (config key trainer.kwargs.label_smoothing). 0 / unset =
+        # hard labels, bit-for-bit the historical behaviour. With eps > 0 the targets become
+        #     y' = y * (1 - eps) + (1 - y) * eps
+        # so the loss is minimised at p = 1 - eps for a positive and p = eps for a negative, i.e. at
+        # the FINITE logit log((1 - eps) / eps) (0.05 -> 2.94, 0.1 -> 2.20). Hard-label BCE has no
+        # such optimum: on a near-separable training set it keeps inflating the logit scale, which is
+        # what widens the score tails and drifts the Youden threshold towards 1.0 (TechnicalGuide.md
+        # 5.1). Scope of the smoothing: the BCE term ONLY. The ranking loss keeps its hard pairwise
+        # targets, and the val/test losses stay hard-label, so the reported metrics remain comparable
+        # with eps = 0 runs (only the loss values themselves are not).
+        self.label_smoothing = _resolve_label_smoothing(label_smoothing)
+        # Hard-label train BCE of the latest epoch (kept for the ckpt/history); the smoothed value is
+        # transferred per epoch by train_epoch().
+        self.last_train_bce_smooth = 0.0
 
         # Factset external validation
         self.factset_edges = factset_edges if factset_edges else []
@@ -561,6 +603,7 @@ class DynamicGraphTrainer:
     def train_epoch(self, epoch, save_path):
         self.model.train()
         total_bce_loss = 0
+        total_bce_smooth_loss = 0
         total_margin_loss = 0
         all_predictions = []
         all_labels = []
@@ -578,7 +621,17 @@ class DynamicGraphTrainer:
             if len(predictions) <= 1:
                 continue
 
+            # Hard-label BCE is what Train/*_BCE reports and what the ckpt stores, so it is always
+            # computed: it keeps the curve comparable across runs and with the hard-label val/test
+            # loss. When label smoothing is on, the term that actually enters the objective is the
+            # smoothed one (its optimum sits at a finite logit, see __init__).
             bce_loss = self.bce_criterion(predictions, labels)
+            if self.label_smoothing > 0:
+                soft_labels = labels * (1.0 - self.label_smoothing) + \
+                    (1.0 - labels) * self.label_smoothing
+                bce_train_loss = self.bce_criterion(predictions, soft_labels)
+            else:
+                bce_train_loss = bce_loss
 
             # Margin Ranking Loss (pairwise ranking constraint)
             margin_loss = torch.tensor(0.0, device=self.device)
@@ -593,11 +646,12 @@ class DynamicGraphTrainer:
                 target = torch.ones_like(pos_expanded)  # expect pos > neg
                 margin_loss = self.margin_loss(pos_expanded, neg_expanded, target)
 
-            loss = bce_loss + self.margin_lambda * margin_loss
+            loss = bce_train_loss + self.margin_lambda * margin_loss
             loss.backward()
             self.optimizer.step()
 
             total_bce_loss += bce_loss.item()
+            total_bce_smooth_loss += bce_train_loss.item()
             total_margin_loss += margin_loss.item()
             all_predictions.append(predictions.detach())
             all_labels.append(labels.detach())
@@ -608,31 +662,44 @@ class DynamicGraphTrainer:
                 batch_labels = torch.cat(all_labels[-10:])
                 precision, recall, f1, auc = self.compute_metrics(batch_predictions, batch_labels)
 
-                pbar.set_postfix({
+                postfix = {
                     'BCE': f'{bce_loss.item():.4f}',
                     'Margin': f'{margin_loss.item():.4f}',
                     'F1': f'{f1:.4f}',
-                })
+                }
+                if self.label_smoothing > 0:
+                    postfix['BCE~'] = f'{bce_train_loss.item():.4f}'
+                pbar.set_postfix(postfix)
 
                 if self.use_tensorboard:
                     step = self.global_train_step
                     self.writer.add_scalar('Train/Batch_BCE', bce_loss.item(), step)
+                    if self.label_smoothing > 0:
+                        # Only written when smoothing is on, so that a run with and a run without it
+                        # cannot be confused on one TensorBoard curve.
+                        self.writer.add_scalar('Train/Batch_BCE_smooth',
+                                               bce_train_loss.item(), step)
                     self.writer.add_scalar('Train/Batch_Margin', margin_loss.item(), step)
                     self.writer.add_scalar('Train/Batch_F1', f1, step)
                     self.writer.add_scalar('Train/Batch_AUC', auc, step)
                     self.global_train_step += 1
 
         if len(all_predictions) == 0:
+            self.last_train_bce_smooth = 0.0
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         all_predictions = torch.cat(all_predictions)
         all_labels = torch.cat(all_labels)
         avg_bce = total_bce_loss / len(self.train_loader)
+        avg_bce_smooth = total_bce_smooth_loss / len(self.train_loader)
+        self.last_train_bce_smooth = avg_bce_smooth
         avg_margin = total_margin_loss / len(self.train_loader)
         precision, recall, f1, auc = self.compute_metrics(all_predictions, all_labels)
 
         if self.use_tensorboard:
             self.writer.add_scalar('Train/Epoch_BCE', avg_bce, epoch)
+            if self.label_smoothing > 0:
+                self.writer.add_scalar('Train/Epoch_BCE_smooth', avg_bce_smooth, epoch)
             self.writer.add_scalar('Train/Epoch_Margin', avg_margin, epoch)
             self.writer.add_scalar('Train/Epoch_F1', f1, epoch)
             self.writer.add_scalar('Train/Epoch_AUC', auc, epoch)
@@ -833,6 +900,21 @@ class DynamicGraphTrainer:
         print(f"Factset edges: {len(self.factset_edges)} (actually used: {factset_display})")
         print(f"Margin Lambda: {self.margin_lambda}, Margin: {self.margin:g} "
               f"(the score gap the ranking loss demands; scores are in [0, 1])")
+        if self.label_smoothing > 0:
+            soft_opt = 1.0 - self.label_smoothing
+            print(f"Label smoothing: eps={self.label_smoothing:g} "
+                  f"(BCE targets {soft_opt:g} / {self.label_smoothing:g}, loss optimum at logit "
+                  f"{math.log(soft_opt / self.label_smoothing):.2f}, i.e. p={soft_opt:g}); "
+                  f"Train/*_BCE stays hard-label, Train/*_BCE_smooth is the optimised term")
+            if self.margin > 1.0 - 2.0 * self.label_smoothing:
+                print(f"  [warn] label smoothing caps the BCE-optimal score gap at "
+                      f"{1.0 - 2.0 * self.label_smoothing:g} while the ranking loss demands "
+                      f"margin={self.margin:g}: the hinge keeps pushing every pair towards "
+                      f"saturation. Consider margin <= {1.0 - 2.0 * self.label_smoothing:g} "
+                      f"(trainer.kwargs.margin).")
+        else:
+            print("Label smoothing: off (hard labels; set trainer.kwargs.label_smoothing, "
+                  "e.g. 0.05, to enable)")
         print(f"Selection criterion: {self.selection_criterion} "
               f"({self.selection_split} split, early stopping patience={patience})")
         print(f"Learning rate: base={self.base_lr:g}, schedule={self._lr_schedule_label()}, "
@@ -900,6 +982,8 @@ class DynamicGraphTrainer:
                     'epoch': epoch,
                     'selection_split': self.selection_split,
                     'train_bce': train_bce,
+                    # Smoothed BCE actually minimised this epoch (== train_bce when smoothing is off)
+                    'train_bce_smooth': self.last_train_bce_smooth,
                     'train_margin': train_margin,
                     'train_f1': train_f1,
                     'train_auc': train_auc,
@@ -958,10 +1042,12 @@ class DynamicGraphTrainer:
                         'selection_use_factset': bool(self.selection_cfg.get('use_factset', True)),
                         'selection_ema_span': float(self.selection_cfg.get('ema_span', 1) or 1),
                         # Loss weights of the BCE + margin_lambda * MarginRankingLoss objective:
-                        # a run trained with a different margin is not comparable with the rest,
-                        # so the effective values travel with the checkpoint.
+                        # a run trained with a different margin / label smoothing is not comparable
+                        # with the rest, so the effective values travel with the checkpoint.
                         'margin_lambda': self.margin_lambda,
                         'margin': self.margin,
+                        'label_smoothing': self.label_smoothing,
+                        'train_bce_smooth': self.last_train_bce_smooth,
                     }
                     save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(save_dict, save_path)
@@ -997,6 +1083,8 @@ class DynamicGraphTrainer:
                         # Loss weights, kept in step with the best-model checkpoint above.
                         'margin_lambda': self.margin_lambda,
                         'margin': self.margin,
+                        'label_smoothing': self.label_smoothing,
+                        'train_bce_smooth': self.last_train_bce_smooth,
                     }
                     auc_save_dict.update(self._factset_ckpt_fields(factset_result))
                     torch.save(auc_save_dict, auc_save_path)

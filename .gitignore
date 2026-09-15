@@ -21,8 +21,11 @@ info/
 *.zip
 
 Analysis/figures/
+Analysis/figures_ci/
 Analysis/visualization/
+Analysis/visualization_ci/
 Analysis/npy_roc_output/
+Analysis/npy_roc_output_ci/
 Analysis/edge_imput_overlap_scan_results.json
 Analysis/edge_imput_overlap_ratio_by_probability.png
 Analysis/edge_imput_overlap_ratio_by_probability.svg

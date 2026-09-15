@@ -24,6 +24,7 @@ Usage:
 import argparse
 import glob
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -36,26 +37,36 @@ from sklearn.metrics import roc_curve, auc
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+sys.path.insert(0, _SCRIPT_DIR)
+import plot_models  # noqa: E402  (same directory; stdlib-only)
 
 # Display names follow Analysis/visualize_results.py::MODEL_DISPLAY; the two-layer GAT-GRU
 # (results/gatgru2layer) and the one-directional variant are written GAT-GRU* / GAT-GRU†.
 MODEL_DISPLAY = {
     'bigru': 'BiGRU',
     'egcn': 'EvolveGCN-H',
+    'egcn-smooth': 'EvolveGCN-H-LS',
     'gatgru': 'GAT-GRU',
     'gatgru2layer': 'GAT-GRU*',
+    'gatgru2layer-smooth': 'GAT-GRU-LS',
     'seal': 'SEAL',
     'tna': 'BiTNA',
+    'fusion1layer': 'GAT-GRU-FiLM',
+    'fusion2layer': 'GAT-GRU*-FiLM',
 }
 
 # GAT-GRU keeps the colour of PrROC2_fff.py so the two figures can be placed side by side.
 MODEL_COLORS = {
     'gatgru': '#1f77b4',
     'gatgru2layer': '#17becf',
+    'gatgru2layer-smooth': '#9edae5',   # lighter cyan: the label-smoothed twin of GAT-GRU*
     'bigru': '#2ca02c',
     'egcn': '#d62728',
+    'egcn-smooth': '#ff7f0e',
     'tna': '#8c564b',
     'seal': '#9467bd',
+    'fusion1layer': '#e377c2',
+    'fusion2layer': '#bcbd22',
 }
 
 BASELINE_CSV = os.path.join(_SCRIPT_DIR, 'edgebank_baseline_results.csv')
@@ -79,6 +90,9 @@ def parse_args():
                              '(default: per-model best AUC)')
     parser.add_argument('--models', nargs='+', default=None,
                         help='restrict to these model directories (default: all found)')
+    parser.add_argument('--model-config', default=None,
+                        help='plot list deciding which models are drawn / how they are named '
+                             f'(default: {plot_models.CONFIG_NAME} next to the results root)')
     parser.add_argument('--no-baseline', action='store_true',
                         help='skip the EdgeBank baseline points')
     return parser.parse_args()
@@ -300,6 +314,17 @@ def main():
     print(f"results : {args.results_dir}")
     print(f"output  : {args.out_dir}")
     print('=' * 60)
+
+    # The plot list decides which models appear and how they are labelled; --models still wins.
+    cfg = plot_models.load_plot_models(args.results_dir, args.model_config)
+    if cfg is not None:
+        available = {d for d in os.listdir(args.results_dir)
+                     if os.path.isdir(os.path.join(args.results_dir, d))} \
+            if os.path.isdir(args.results_dir) else set()
+        names = cfg.mapping(available=available, base_names=MODEL_DISPLAY)
+        MODEL_DISPLAY.update(names)
+        if not args.models:
+            args.models = list(names)
 
     runs = discover_runs(args.results_dir, args.models)
     if not runs:
