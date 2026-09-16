@@ -1,0 +1,49 @@
+# ============================================================
+# GAT-GRU* (2-layer BiGRU) + degree channel + downstream aggregation
+# 实验 A × B 的交叉格：use_attr_degree = true 且 message_direction = target_to_source
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 2 层版 2×2 的第四格（其余三格：gatgru_2layer / gatgru_2layer_deg / gatgru_2layer_down）。
+# 单独跑意义有限，价值在于凑齐 2×2 后判断两个因素是否独立。
+#
+# 注意事项见 gatgru_vec_deg.yaml（度是传导式统计量、旧 ckpt 失效、首次写回 Neo4j）
+# 与 gatgru_vec_down.yaml（只改方向，参数形状不变）。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   python SampleSetting/run_sampling.py -c gatgru_2layer_deg_down -s gatgru_2layer_deg_down -d cuda:0
+# ============================================================
+
+name: GAT-GRU*-Vec+Deg-Down
+output_subdir: gatgru_2layer_deg_down
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+  use_attr_degree: true
+  degree_property: degree
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 2            # <- GAT-GRU* 的定义（1 层是 gatgru_vec）
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    message_direction: target_to_source
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

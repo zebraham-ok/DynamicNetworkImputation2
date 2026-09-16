@@ -325,6 +325,29 @@ that block (no `<NA>` category is reserved). Attribute names must match the Neo4
 actually being read (anonymised releases rename some properties). When the switch is off,
 `X` is the 128-dimensional embedding alone.
 
+#### 5.1.1 Optional degree channel
+
+An **optional** extra column `log(1 + degree)` can be appended at the end of `X`
+(`701 → 702` with the attributes above). This is the only place where a structural property of
+the graph enters the input representation: by default the encoders use degree-normalised
+(mean-type) aggregation and therefore cannot express how many neighbours a node has, only the
+composition of its neighbourhood.
+
+```yaml
+dataset:
+  use_attr_degree: false        # true -> append log1p(degree) as the last column of X
+  degree_property: degree       # Neo4j property that stores the degree
+```
+
+`degree` counts the incident `(source, target, year)` triples of the 2013-2025 window on both
+endpoints (the same quantity `min_degree` thresholds on, restricted by `source_filter`). It is
+persisted on the Neo4j node as `degree_property`: when that property is missing the dataset
+computes it once and writes it back before the first feature assembly, so later runs simply read
+it. Two caveats: (i) it is a **whole-window, transductive** statistic, so a run with the channel
+enabled must not be compared with the baseline on val/test metrics — use it to test *whether*
+degree information helps, not to claim a better model; (ii) turning it on changes the width of
+`X`, so every checkpoint has to be retrained.
+
 All five backbones then feed `X` through **one shared extractor**
 (`Models/common.py → NodeFeatureExtractor`, built only via `build_feature_extractor`) whose
 configuration is declared **once** for every backbone — in `Training/common_config.yaml`,

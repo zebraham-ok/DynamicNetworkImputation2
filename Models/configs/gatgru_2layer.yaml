@@ -34,6 +34,10 @@ model:
     time_steps: auto
     device: auto
     use_checkpoint: true
+    # Direction of the GAT message passing, same two-value switch as in gatgru_vec.yaml
+    # (see the comments there): source_to_target = aggregate suppliers (default, historical),
+    # target_to_source = aggregate customers.
+    message_direction: source_to_target
 
 trainer:
   type: standard

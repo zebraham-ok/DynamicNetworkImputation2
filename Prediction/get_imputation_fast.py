@@ -290,6 +290,9 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         'use_pred_neg': ds_cfg.get('use_pred_neg', True),
         'use_attr_onehot': ds_cfg.get('use_attr_onehot', False),
         'onehot_attrs': ds_cfg.get('onehot_attrs', None),
+        # Degree channel: must match the layout the checkpoint was trained on (d -> d + 1)
+        'use_attr_degree': ds_cfg.get('use_attr_degree', False),
+        'degree_property': ds_cfg.get('degree_property', 'degree'),
     }
     for k, v in extra_candidates.items():
         if k in cls_params:
@@ -400,6 +403,7 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         'year_to_idx': year_to_idx,
         'time_steps': time_steps,
         'num_nodes': dynamic_data.num_nodes,
+        'num_features': int(dynamic_data.x.size(1)),
         'min_degree': min_degree,
         'checkpoint_path': checkpoint_path,
     }
@@ -1250,6 +1254,9 @@ def main():
         'checkpoint': os.path.abspath(ckpt_path),
         'checkpoint_mtime': round(os.path.getmtime(ckpt_path), 3) if os.path.exists(ckpt_path) else None,
         'num_nodes': model_info['num_nodes'],
+        # Width of X: the degree channel (dataset.use_attr_degree) changes d -> d + 1, so cached
+        # embeddings of a differently-built X must not be reused even with the same checkpoint.
+        'num_features': model_info.get('num_features'),
         'time_steps': [int(t) for t in model_info['time_steps']],
         # The graph is sparser when min_degree > 0, so the cached embeddings are no longer valid
         # for another min_degree even with the same checkpoint and node count.

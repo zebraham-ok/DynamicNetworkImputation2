@@ -1,0 +1,55 @@
+# ============================================================
+# GAT-GRU* (2-layer BiGRU) + degree channel
+# 实验 A（唯一变量）：dataset.use_attr_degree = true -> X 末尾多一列 log(1+degree)
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 与 gatgru_2layer.yaml 的差别只有一处：`dataset.use_attr_degree: true`
+#   X = [embedding(128) | one-hot(...) | log1p(degree)] = 701 -> 702
+# 基线的 GAT-GRU*（results/四次双模式/ensemble/gatgru2layer/）在四个负采样模式上都不弱于
+# 单层，所以用 2 层再跑一遍实验 A，可以顺带看"度信息"在强 backbone 上是否还有增益。
+#
+# 注意事项（TechnicalGuide.md §3.5，逐条同样适用于这份 config）：
+#   * degree = 2013-2025 窗口 (source,target,year) 三元组两端计数，受 source_filter 约束，
+#     与 min_degree 同尺度；首次运行由数据集算好写回 Neo4j 属性 `degree_property`。
+#   * 传导式特征（含 val/test 边）⇒ 不能与未开度通道的 baseline 在 val/test 上并列比较。
+#   * X 宽了一列 ⇒ 旧 ckpt / backbone.pth 全部失效，必须重训（含 Phase 1）。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   python SampleSetting/run_sampling.py -c gatgru_2layer_deg -s gatgru_2layer_deg -d cuda:0
+# ============================================================
+
+name: GAT-GRU*-Vec+Deg
+output_subdir: gatgru_2layer_deg
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+  use_attr_degree: true
+  degree_property: degree
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 2            # <- GAT-GRU* 的定义（1 层是 gatgru_vec）
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # 传播方向沿用基线（source_to_target = 聚合供应商/入邻）
+    message_direction: source_to_target
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

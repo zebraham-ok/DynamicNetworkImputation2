@@ -43,6 +43,12 @@ data:
     - country
     - industry_2nd
     - category_3rd
+  # Degree channel: true -> append one column log(1 + degree) to X (d -> d + 1). The degree is the
+  # whole-window incident-triple count written to the Neo4j property `degree_property` on demand.
+  # This config does NOT inherit Training/common_config.yaml, so keep the value in sync by hand.
+  # Transductive statistic (it also sees val/test edges) - do not compare with the no-degree run.
+  use_attr_degree: false
+  degree_property: degree
 
 # === Bootstrap iterations ===
 bootstrap:

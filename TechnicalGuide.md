@@ -134,6 +134,30 @@ Analysis/visualize_results.py  →  Table 3 / 附录图（需先把 eventfile �
 - **宽度约束**：`fusion_temporal_injection` 要求 `static_hidden_dim == fc_embed_dim`（`W_t` 由 `mean_N(z)` 驱动却作用于 GAT 输出），构造时显式 `ValueError`；`fusion_film` 无此约束。
 - **运行**：`python SampleSetting/run_sampling.py -c fusion_temporal_injection -s fusion_temporal_injection -d cuda:0`；两个 yaml 的 `output.subdir` 只覆盖自身，**换 config 必须显式 `-s`**（§8）。
 
+### 1.3 实验变体配置（2026-09-15 新增，**不是新 backbone**）
+
+两组 2×2 消融用的 config，模块 / 类与 `gatgru_vec` / `gatgru_2layer` **完全相同**，只是把 §3.5 的度通道与 §4.1.1 的传播方向两个开关单独打开（各文件与基线的差异只有那一行）。
+
+| 因素 | 开关 | 取值 | 文件名后缀 |
+|---|---|---|---|
+| A 度通道 | `dataset.use_attr_degree` | `false`（基线）/ `true`（X 末尾 +`log1p(degree)`，701 → 702） | `_deg` |
+| B 传播方向 | `model.kwargs.message_direction` | `source_to_target`（基线：聚合**供应商 / 入邻**）/ `target_to_source`（聚合**客户 / 出邻**，与手写 GCN 路径同向） | `_down` |
+
+| config 名 | A 度 | B 方向 | 备注 |
+|---|---|---|---|
+| `gatgru_vec` | off | upstream | 基线（GAT-GRU，1 层 BiGRU） |
+| `gatgru_vec_deg` | on | upstream | 只多一列度 |
+| `gatgru_vec_down` | off | downstream | 只改方向 |
+| `gatgru_vec_deg_down` | on | downstream | 交叉格 |
+| `gatgru_2layer` / `_deg` / `_down` / `_deg_down` | 同上 | 同上 | GAT-GRU\*（2 层 BiGRU）版本的同一组 2×2 |
+
+- **运行必须显式 `-s <config 名>`**（§8 陷阱 1：`sample_setting.yaml → output.subdir` 写死 `gatgru`）；
+  `python SampleSetting/run_sampling.py -c gatgru_vec_deg -s gatgru_vec_deg -d cuda:0`
+- **两因素的可比性不同，别混着下结论**：
+  - B（方向）参数形状与 `state_dict` 键不变 ⇒ 两格可直接对照（同 seed、同 split），ckpt 还能互换加载；
+  - A（度）是**传导式特征**（度由全窗口正样本算得，含 val/test 边）⇒ 开度的 run **不能**与关度的 run 在 val/test 指标上并列；且 X 宽了一列 ⇒ 旧 ckpt / `backbone.pth` 全部失效，Phase 1 必须重跑。
+- 度只在**首次**使用时写回 Neo4j 属性 `degree_property`（5000 条一批，幂等），之后训练 / bootstrap / 插补各入口直接读 —— 所以第一个跑的 `_deg` config 会多花几分钟。
+
 ---
 
 ## 2. 配置系统
@@ -245,6 +269,23 @@ create_dataloaders(
 - 样本：`(link_indices: LongTensor[B, 2], current_times: FloatTensor[B], label: FloatTensor[B])`。
 - 时间编码：`time_var = (year - 起始年) / 年数`，由 trainer 侧按 `current_times` 传入模型。
 
+### 3.5 节点特征：度通道 `dataset.use_attr_degree`（2026-09-15 新增，默认关）
+
+`X` 可以再拼**一列** `log(1 + degree)`，拼在最后：
+
+```
+X = [ embedding(128) | one-hot(country) | one-hot(industry_2nd) | one-hot(category_3rd) | log1p(degree) ]
+     701 → 702
+```
+
+- 开关：`Training/common_config.yaml → dataset.use_attr_degree`（默认 `false` ⇒ 行为逐字不变）；属性名 `dataset.degree_property`（默认 `degree`）。`Bootstraps/bootstrap_v2_config.yaml` **不继承** common，需手工同步。
+- 度的定义：2013–2025 窗口内**两端都计入、按 (source, target, year) 三元组计次数**（含跨年重复），受 `dataset.source_filter` 约束 —— 与 `min_degree` 过滤用的是同一个量，因此两者同尺度可比。**不等同于"不同交易对手个数"**。
+- 落库与复用：该度以整数写入 Neo4j 节点属性 `degree_property`。`CompanySupplyDataset._ensure_degree_property()` 在 `_cache_company_info` 里先查"有多少个带 embedding 的节点缺这个属性"，缺失才计算并分 5000 条一批写回（孤立节点也显式写 `0`，保证下次不重算）；已完整覆盖时直接读。属性名会被插值进 Cypher，故先过 `validate_property_name()`（白名单 `[A-Za-z_][A-Za-z0-9_]*`）。
+- 只有 `full_dataset` 会查库，其余 split 经 `_share_metadata` 复用同一个 `degree_values`（按 PyG 节点下标索引的 float32 向量），因此不会重复写库。
+- **陷阱（写论文前必读）**：度是**全窗口的传导式（transductive）统计量** —— 它由窗口内所有正样本算得，包含 val/test 边。因此 `use_attr_degree=true` 的 run **不能**与关闭该开关的 baseline 在 val/test 指标上并列比较；它只能用来回答"度信息到底有没有用"。
+- **陷阱**：`source_filter` 为空时该查询会扫库里**全部** `SupplyProductTo` 关系（插补库是 10^8 量级）—— 代码会先打一行 WARNING。
+- 推理侧：X 宽度变化会进嵌入缓存 `meta.num_features`（`Prediction/get_imputation_fast.py`），换开关即自动重算，不会拿旧缓存静默推理；但**旧 ckpt 全部失效**，必须重训。
+
 ---
 
 ## 4. 模型层接口
@@ -261,6 +302,20 @@ apply_node_feature_extractor(extractor, x) -> Tensor
 - 结构：`[Linear(in, hidden) - ReLU - Dropout] × (n-1)` + `Linear(hidden, out)`；`hidden_dim=None → output_dim * 2`。
 - 参数落点：`Training/common_config.yaml → model.kwargs`（**唯一可改处**），模型 yaml 不得重复声明。
 - 输入 `input_dim = dynamic_data.x.size(1)`（由 `resolve_auto_kwargs` 的 `auto` 解析，见 §4.3）。
+
+### 4.1.1 GAT 传播方向 `model.kwargs.message_direction`（2026-09-15 新增，默认 `source_to_target`）
+
+`GATEncoderVectorized`（GAT-GRU / GAT-GRU† / GAT-GRU\* / TI / FiLM 共用）把 PyG 的 `flow` 暴露成配置键
+`model.kwargs.message_direction`，取值两个：
+
+| 取值 | 边的流向 | 节点聚合的是 | 备注 |
+|---|---|---|---|
+| `source_to_target` | 供应商 → 客户 | **供应商（入邻 / 上游）** | 默认，**逐位复现所有既有 GAT-GRU ckpt** |
+| `target_to_source` | 客户 → 供应商 | **客户（出邻 / 下游）** | 与手写 GCN 路径（`precompute_adj_matrices` + `torch.sparse.mm`，Node-GRU / TNA / EGCN 一直在用）同向 |
+
+- 只改消息传播方向，**参数形状与 `state_dict` 键完全一致** ⇒ 两个设置可直接对照（同 seed、同 split），ckpt 可互换加载。
+- 非法取值在构造时抛 `ValueError`（`MESSAGE_DIRECTIONS`）。
+- 注意归一化口径的另一处差异：PyG `GCNConv` 用**入度**归一化（`gcn_norm` 取 `idx=col`），我们手写的 `precompute_adj_matrices` 用**出度**（`bincount(row)`）；有向图上两者不同，写"度"时必须说明是有向 in / out。
 
 ### 4.2 forward 签名（两种，trainer 自动识别）
 
@@ -486,6 +541,8 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 |---|---|---|---|
 | `dataset.batch_size` | 模型 yaml | DataLoader | 显存 / step 数 / 曲线粒度 |
 | `dataset.use_attr_onehot`, `onehot_attrs` | common | `dataset_feature_kwargs` | **X 宽度 ⇒ 旧 ckpt 不兼容** |
+| `dataset.use_attr_degree`, `degree_property` | common（默认 `false`；`Bootstraps/bootstrap_v2_config.yaml` 需手工同步；变体 config `*_deg` 在模型 yaml 覆盖为 `true`） | `dataset_feature_kwargs` → `_ensure_degree_property` | X **+1 列** `log1p(degree)` ⇒ 旧 ckpt 不兼容；度是全窗口传导式统计量，**不可与 baseline 在 val/test 上并列比较**（§3.5、§1.3） |
+| `model.kwargs.message_direction` | 模型 yaml（`gatgru_vec` / `gatgru_2layer` 及 `*_down` 变体） | `GATEncoderVectorized` | GAT 聚合方向（上游/下游），**参数形状不变**，两组实验可直接对照（§4.1.1、§1.3） |
 | `dataset.filter_factset_neg`, `intra_industry_neg`, `use_pred_neg` | `sample_setting.yaml`（模式定义） | `create_dataloaders` | 负样本分布（4 模式） |
 | `dataset.min_degree`, `source_filter` | common | 正样本池 | 样本量 |
 | `model.kwargs.use_fc_embedding/fc_embed_dim/fc_hidden_dim/fc_num_layers` | common | `build_feature_extractor` | 共享编码器 ⇒ 旧 ckpt 不兼容 |
@@ -530,6 +587,8 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 15. **置信区间的 n**：CI 由 t 分位数给出，`n < 5` 只能看离散度、不宜在论文里引用区间；`run_sampling.py` 在 `repeats < 5` 时会打印提示。
 16. **轮换后不能按 `{idx}_{name}_{role}` 精确键做跨种子均值**：角色在 repeat 之间搬家 ⇒ 每个键只剩 n=1（`aggregate` 仍会打印出来，容易误读为"重复性差"）。跨种子看模式效果请用 `by_mode` / `seed_ci_summary.py`（按模式合并角色）。同理，轮换 run 的 `seed*/` 目录不能直接按 flag 名重排进 `results/<model>/<MMDD-HHMM>-<flag>/` 做跨 flag 对比：**同一 repeat 内 4 个 flag 的角色不同**，跨 repeat 才平衡。
 17. **轮换改变的是"谁能吃到谁的骨干"，不是协议**：轮换下每个模式的均值里混了 1 次 scratch + N-1 次 frozen（`by_role` 分开存）；若要报"全部模式都在冻骨干条件下"的纯对比，用 `by_role.frozen`；反之纯 scratch 对比每个模式只有 1 个点。写论文时必须说明用的是哪一种口径。
+18. **GAT 与手写 GCN 的传播方向相反（2026-09-15 记录）**：`GATConv` 默认 `flow='source_to_target'` ⇒ 客户聚合供应商（入邻）；而 `precompute_adj_matrices` + `torch.sparse.mm` 按行传播 ⇒ 供应商聚合客户（出邻）。做"度/中心性"相关解释或跨 backbone 对比时必须先统一口径（`message_direction`，§4.1.1）。
+19. **`use_attr_degree=true` 的 run 不能与 baseline 并列**：度由全窗口正样本（含 val/test 边）算得，属传导式特征；同理 `source_filter` 为空时会扫全库（插补库 10^8 关系），见 §3.5。
 
 ---
 
@@ -572,6 +631,11 @@ sampling_*/seed<SEED>/*_frozen/events.*    → Analysis/visualize_results.py --s
 | 2026-09-15 | **插补推理改成配置驱动换模型**：`get_imputation_fast.py` 不再只认 `--config`，可由 `imputation_common.yaml` 的 `model.config_name / checkpoint / run_dir / checkpoint_name / strict / device` 决定加载哪个 backbone，并按 `prediction.threshold_by_model` 取各自的分数阈值 | `Prediction/get_imputation_fast.py`、`Prediction/imputation_common.yaml` | 新增 `IMPUTATION_YAML`/`DEFAULT_MODEL_CONFIG`、`_load_yaml`/`_imputation_yaml`/`resolve_model_config_name`（`--config` > yaml > `gatgru_vec`）、`check_prediction_interface`、`_newest_checkpoint`；`_find_checkpoint` 改为三级解析；`EmbeddingCache` 新增 `meta`（ckpt 路径+mtime+config 名+节点数+年份轴，不符即重算）与"temporal_encoder 必填入参≤1"判定（FiLM/TI 与 EGCN 走逐 batch forward）；`load_model` 新增 0 键命中直接报错、`strict` 校验、`data.time_steps` 钉年份轴；`--config` 默认值 `gatgru_vec` → `None`（yaml 可生效）。**旧行为不变**：不填即 `gatgru_vec` + 全局 threshold 0.452 | §2.3, §9 |
 
 | 2026-09-15 | **插补构图支持 `min_degree` + 低度节点可排除**：`data.min_degree`（默认 0 ⇒ 行为与之前逐字一致）决定推理图的边过滤（与训练同规则：两端度都达标才留边）⇒ 决定动态嵌入的计算图；`data.exclude_low_degree_nodes`（默认 `false`）为 `true` 时把度 < `min_degree` 的节点剔除出插补候选名单，不再给训练图里几乎不可见的度 0/1 节点打分 | `Prediction/get_imputation_fast.py`、`Prediction/imputation_common.yaml` | 新增 `compute_node_degrees()`（一次轻量查询，按**未过滤**正样本统计端点次数）与 `ImputationPredictorFast._filter_low_degree_companies()`（取完行业公司后过滤，随后才估算候选量）；`load_model` 的 `min_degree` 从写死 0 改为读 `data.min_degree`，并写入 `model_info` 与嵌入缓存 `meta`（换 `min_degree` 自动重算，避免拿旧缓存静默推理）；CLI 新增 `--min-degree`、`--exclude-low-degree-nodes`/`--keep-low-degree-nodes`；启动与 run 各打印一行；`min_degree<=0` 而开关为 `true` 时打印告警并忽略 | §2.3, §9 |
+
+| 2026-09-15 | **节点特征新增度通道 `dataset.use_attr_degree`**：`true` 时在 X 末尾追加**一列** `log(1+degree)`（701 → 702）。度 = 窗口内按 (source,target,year) 三元组两端累计的次数（与 `min_degree` 同尺度），首次使用时由 `_ensure_degree_property()` 计算并写回 Neo4j 节点属性 `degree_property`（5000 条一批，孤立节点写 0，幂等；属性名过 `validate_property_name()` 白名单），之后各入口只读 | `Training/common_config.yaml`、`Bootstraps/bootstrap_v2_config.yaml`、`Data/graph_dataset.py`、`Data/company_dataset.py`、`Prediction/get_imputation_fast.py`、`README.md` | `CompanySupplyDataset` 新增构造参数 `use_attr_degree`/`degree_property` 与属性 `degree_values`；新增 `_degree_edge_query()`/`_ensure_degree_property()`/模块级 `validate_property_name()`；`dataset_feature_kwargs` 新增 2 键；`create_bootstrap_datasets`/`create_dataloaders` 各新增 2 个形参（默认关 ⇒ 行为不变）；`_share_metadata` 共享 `degree_values`；`assemble_node_features` 末尾追加列并在行数不齐时 `ValueError`；`describe_node_features` 输出带上 `+ log1p(degree)`；`get_imputation_fast.py` 的 `extra_candidates` 新增 2 键、`model_info`/缓存 `meta` 新增 `num_features`（换开关自动重算嵌入）。**默认 false ⇒ 旧 ckpt 仍可用；置 true 后 X 宽度 +1 ⇒ 旧 ckpt 失效且该 run 不可与 baseline 在 val/test 上并列（传导式特征）** | §3.5, §7, §8 |
+| 2026-09-15 | **GAT 传播方向开关 `model.kwargs.message_direction`**：把 PyG 的 `flow` 暴露到配置，`source_to_target`（默认，历史行为：客户聚合供应商/入邻）与 `target_to_source`（供应商聚合客户/出邻，与手写 GCN 路径同向），用于"聚合上游 vs 下游"两组对照实验 | `Models/common_vectorized.py`、`Models/gatgru_vectorized.py`、`Models/gatgru_1dire.py`、`Models/fusion_film.py`、`Models/fusion_temporal_injection.py`、`Models/configs/gatgru_vec.yaml`、`Models/configs/gatgru_2layer.yaml` | `GATEncoderVectorized` 新增 `message_direction` 形参与常量 `MESSAGE_DIRECTIONS`（非法值 `ValueError`），透传给两个 `GATConv(flow=...)`；4 个 GAT 系模型类各新增同名形参（默认 `'source_to_target'` ⇒ 逐位复现既有 ckpt）；**参数形状与 `state_dict` 键不变**，两设置可直接互换加载与对照。自检：合成链 0→1→2 上两个方向的节点 0/2 输出确有差异（Δ≈1.26/1.09），参数名集合相同 | §4.1.1, §7, §8 |
+
+| 2026-09-15 | **两组 2×2 消融的实验变体 config（6 份）**：`gatgru_vec` 与 `gatgru_2layer` 各配 `_deg`（`dataset.use_attr_degree: true`，X 701 → 702）、`_down`（`message_direction: target_to_source`，聚合客户/出邻）、`_deg_down`（交叉格）三份，与基线凑成完整 2×2 | `Models/configs/gatgru_vec_{deg,down,deg_down}.yaml`、`Models/configs/gatgru_2layer_{deg,down,deg_down}.yaml`（新增） | 纯新增文件，**不动任何既有 config 与代码**（基线 `gatgru_vec` / `gatgru_2layer` 逐字不变）；每份与基线的差异只有 1–2 个键，文件头写明实验目的、注意事项与运行命令（`output_subdir` 随文件名，但 `run_sampling.py` 仍要求显式 `-s`，§8 陷阱 1）；8 份 config 全部经 `load_config` 实测解析正确（deg / dir / num_rnn_layers / name 逐项核对） | §1.3, §7 |
 
 ### 9.1 改动检查清单
 

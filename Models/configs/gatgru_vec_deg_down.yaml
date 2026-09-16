@@ -1,0 +1,52 @@
+# ============================================================
+# GAT-GRU-Vec + degree channel + downstream aggregation
+# 实验 A × B 的交叉格：use_attr_degree = true 且 message_direction = target_to_source
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 2×2 设计的第四格（其余三格：gatgru_vec / gatgru_vec_deg / gatgru_vec_down）。
+# 单独跑它意义有限，价值在于与另外三格组成完整的 2×2，用来看两个因素是否独立：
+#   X 宽度 701 -> 702（+log1p(degree)），传播方向改为聚合客户 / 出邻。
+#
+# 两个开关的注意事项见各自的文件头：
+#   * gatgru_vec_deg.yaml  —— 度是全窗口传导式统计量，开了就不能与 baseline 在 val/test 上并列；
+#                             旧 ckpt 全部失效；首次运行会把 degree 写回 Neo4j。
+#   * gatgru_vec_down.yaml —— 只改方向，参数形状不变，可与 source_to_target 直接对照。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   python SampleSetting/run_sampling.py -c gatgru_vec_deg_down -s gatgru_vec_deg_down -d cuda:0
+# ============================================================
+
+name: GAT-GRU-Vec+Deg-Down
+output_subdir: gatgru_vec_deg_down
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+  use_attr_degree: true
+  degree_property: degree
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    message_direction: target_to_source
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

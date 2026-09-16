@@ -17,12 +17,31 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 import torch
 from torch.utils.data import Dataset
 import random
+import re
 import numpy as np
 from typing import List, Tuple, Dict
 from torch_geometric.data import Data
 
 # Default negative-sample file path (relative to this module's directory)
 _DEFAULT_NEG_DIR = os.path.join(os.path.dirname(__file__), "stopped_neg_sample.csv")
+
+# Study window of the degree statistic (same window as the positive-sample query)
+_DEGREE_YEAR_MIN = 2013
+_DEGREE_YEAR_MAX = 2025
+
+# Cypher cannot take a property name as a query parameter, so every name that is interpolated
+# into a query string has to pass this guard first.
+_PROPERTY_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def validate_property_name(name: str) -> str:
+    """Validate a Neo4j property name that has to be interpolated into a Cypher query."""
+    if not isinstance(name, str) or not _PROPERTY_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid Neo4j property name: {name!r} "
+            f"(must match [A-Za-z_][A-Za-z0-9_]*; it is interpolated into a Cypher query)"
+        )
+    return name
 
 
 def load_predefined_negatives(neg_dir, company_ids):
@@ -64,7 +83,8 @@ class CompanySupplyDataset(Dataset):
                  positive_samples=None, predifined_neg_data=None, fixed_neg_data=None,
                  min_degree=2, source_filter='semi', other_possible_fill=0.0,
                  filter_factset_neg=False, intra_industry_neg=True, use_pred_neg=True,
-                 use_attr_onehot=False, onehot_attrs=None):
+                 use_attr_onehot=False, onehot_attrs=None,
+                 use_attr_degree=False, degree_property='degree'):
         """
         Args:
             min_degree: both endpoint nodes of an edge must have degree >= min_degree (0=no filter)
@@ -86,6 +106,16 @@ class CompanySupplyDataset(Dataset):
                 vocabulary file has to be shipped with the dataset. A missing / empty attribute is
                 encoded as an all-zero row of that block (no ``<NA>`` category is reserved), so the
                 block width equals the number of distinct non-empty values.
+            use_attr_degree: if True, append ONE column log(1 + degree) to X, so that
+                X = [embedding | one-hot(...) | log1p(degree)]. ``degree`` is the number of incident
+                (source, target, year) triples in 2013-2025 counted on both endpoints (the same
+                quantity ``min_degree`` thresholds on, restricted by ``source_filter``). It is read
+                from the Neo4j property ``degree_property``; when that property is missing (or only
+                partially filled) it is computed once and written back to Neo4j first.
+                NOTE: the statistic is transductive - it sees every positive of the window, including
+                the val/test edges - so it must not be enabled for runs that are compared with the
+                no-degree baseline on val/test metrics.
+            degree_property: name of the Neo4j node property that stores (or will store) the degree.
         """
         self.embedding_name = embedding_name
         self.negative_ratio = negative_ratio
@@ -106,12 +136,16 @@ class CompanySupplyDataset(Dataset):
                 "use_attr_onehot=True requires onehot_attrs, e.g. "
                 "onehot_attrs: ['country', 'industry_2nd', 'category_3rd']"
             )
+        self.use_attr_degree = bool(use_attr_degree)
+        self.degree_property = validate_property_name(degree_property or 'degree')
         # Filled in by _cache_company_info (None when the one-hot option is disabled)
         self.attr_onehot_matrix = None
         self.attr_onehot_row = {}
         self.attr_onehot_vocabs = {}
         self.attr_onehot_sizes = {}
         self.attr_onehot_dim = 0
+        # Degree channel: float vector indexed by PyG node index (None when disabled)
+        self.degree_values = None
         
         if isinstance(sample_seed, int):
             self.random=random.Random(sample_seed)
@@ -197,6 +231,9 @@ class CompanySupplyDataset(Dataset):
         if self.use_attr_onehot:
             self._build_attr_onehot(result)
 
+        if self.use_attr_degree:
+            self.degree_values = self._ensure_degree_property()
+
         # All years (restricted to the 2013-2025 study window)
         result = self.neo4j_host.execute_query("""
             MATCH ()-[r:SupplyProductTo]->()
@@ -257,19 +294,107 @@ class CompanySupplyDataset(Dataset):
         self.attr_onehot_dim = offset
         self.attr_onehot_row = {company_id: i for i, company_id in enumerate(seen_ids)}
 
+    def _degree_edge_query(self) -> str:
+        """Positive-edge query behind the degree statistic.
+
+        Same population as ``_get_positive_samples`` (embedding on both endpoints, study window,
+        ``source_filter``) but WITHOUT the ``min_degree`` filter - the degree has to be computed
+        before anything can be filtered by it.
+        """
+        source_clause = ""
+        if self.source_filter:
+            source_clause = f" AND r.source = '{self.source_filter}'"
+        return f"""
+            MATCH (c1:EntityObj)-[r:SupplyProductTo]->(c2:EntityObj)
+            WHERE c1.{self.embedding_name} IS NOT NULL AND c2.{self.embedding_name} IS NOT NULL
+            AND r.year IS NOT NULL AND r.year >= {_DEGREE_YEAR_MIN} AND r.year <= {_DEGREE_YEAR_MAX}{source_clause}
+            RETURN id(c1) as source_id, id(c2) as target_id
+        """
+
+    def _ensure_degree_property(self) -> np.ndarray:
+        """Return the degree of every node as a vector indexed by PyG node index.
+
+        The degree is persisted on the Neo4j node as ``self.degree_property`` so that the value is
+        computed once and then shared by every run / every entry point (training, bootstrap,
+        imputation). When the property is missing or only partially present it is computed here and
+        written back in batches; the write is idempotent, so a re-run just reads the property.
+
+        Definition: number of incident (source, target, year) triples in the study window, counted
+        on BOTH endpoints - the exact quantity ``min_degree`` thresholds on. Nodes without any edge
+        get 0 (explicitly written, so the "is the property there?" check does not re-trigger).
+        """
+        prop = self.degree_property
+        if not self.source_filter:
+            print("[Degree] WARNING: dataset.source_filter is unset -> the degree is computed over EVERY "
+                  "SupplyProductTo relationship in the database (i.e. also over imputed edges, 10^8 rows in "
+                  "the imputed graph). Set dataset.source_filter (e.g. 'semi') to stay on the training "
+                  "population, or pre-fill the property yourself.")
+        total = self.neo4j_host.execute_query(
+            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL RETURN count(c) AS n"
+        )[0]["n"]
+        present = self.neo4j_host.execute_query(
+            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL AND c.`{prop}` IS NOT NULL "
+            f"RETURN count(c) AS n"
+        )[0]["n"]
+
+        if present < total:
+            print(f"[Degree] property '{prop}' found on {present}/{total} embedded nodes -> "
+                  f"computing it and writing it back to Neo4j")
+            degree = {}
+            for record in tqdm(self.neo4j_host.execute_query(self._degree_edge_query()),
+                               desc="computing degree"):
+                src, tgt = record["source_id"], record["target_id"]
+                degree[src] = degree.get(src, 0) + 1
+                degree[tgt] = degree.get(tgt, 0) + 1
+
+            rows = [{'id': int(cid), 'deg': int(degree.get(cid, 0))} for cid in self.node_mapping]
+            batch_size = 5000
+            for start in range(0, len(rows), batch_size):
+                self.neo4j_host.execute_query(
+                    f"UNWIND $rows AS row MATCH (c:EntityObj) WHERE id(c) = row.id "
+                    f"SET c.`{prop}` = row.deg",
+                    parameters={'rows': rows[start:start + batch_size]},
+                )
+            written = sum(1 for r in rows if r['deg'] > 0)
+            print(f"[Degree] wrote '{prop}' for {len(rows)} nodes ({written} with at least one edge, "
+                  f"max degree {max((r['deg'] for r in rows), default=0)})")
+        else:
+            print(f"[Degree] property '{prop}' already present on all {total} embedded nodes -> reusing it")
+
+        records = self.neo4j_host.execute_query(
+            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL "
+            f"RETURN id(c) AS company_id, coalesce(c.`{prop}`, 0) AS deg"
+        )
+        by_id = {record["company_id"]: float(record["deg"]) for record in records}
+        values = np.zeros(len(self.node_mapping), dtype=np.float32)
+        for company_id, idx in self.node_mapping.items():
+            values[idx] = by_id.get(company_id, 0.0)
+        return values
+
     def describe_node_features(self, feature_dim: int = None) -> str:
         """Human-readable description of how X is assembled (printed once per graph build)."""
         embedding_dim = len(next(iter(self.company_embeddings.values()))) if self.company_embeddings else 0
-        if self.attr_onehot_matrix is None:
+        extras = []
+        total = embedding_dim
+        if self.attr_onehot_matrix is not None:
+            blocks = ", ".join(f"{name}={self.attr_onehot_sizes[name]}" for name in self.onehot_attrs)
+            extras.append(f"one-hot[{blocks}] (missing attribute -> all-zero row)")
+            total += self.attr_onehot_dim
+        if self.degree_values is not None:
+            extras.append("log1p(degree)")
+            total += 1
+
+        if not extras:
             text = (f"[Features] X = embedding({embedding_dim}) = {feature_dim if feature_dim else embedding_dim} "
                     f"(attribute one-hot DISABLED)")
             if self.onehot_attrs:
                 text += f"; enable it with dataset.use_attr_onehot=true (attrs: {self.onehot_attrs})"
+            if self.use_attr_degree:
+                text += "; degree channel requested but not built yet"
             return text
-        blocks = ", ".join(f"{name}={self.attr_onehot_sizes[name]}" for name in self.onehot_attrs)
-        total = embedding_dim + self.attr_onehot_dim
-        return (f"[Features] X = embedding({embedding_dim}) + one-hot[{blocks}] "
-                f"= {total} (attribute one-hot ENABLED; missing attribute -> all-zero row)")
+
+        return (f"[Features] X = embedding({embedding_dim}) + " + " + ".join(extras) +
+                f" = {total}")
 
     def _build_year_distribution(self):
         """Build year-distribution info for uniform sampling (align to the year with the fewest samples, avoiding year bias and leakage)"""
@@ -561,11 +686,14 @@ class CompanySupplyDataset(Dataset):
 def assemble_node_features(full_set: CompanySupplyDataset) -> torch.Tensor:
     """Assemble the node feature matrix X used by every backbone model.
 
-    X = [ dense text embedding | optional one-hot attribute blocks ] with the row order given by
-    ``full_set.reverse_node_mapping`` (i.e. PyG node index -> neo4j id).  This is the single place
-    where node features are materialised, so training and bootstrap reuse exactly the same layout.
-    A node whose attribute is missing contributes an all-zero row for that block, so the width of
-    X is fixed by the vocabulary but individual rows are not full one-hot encodings.
+    X = [ dense text embedding | optional one-hot attribute blocks | optional log1p(degree) ]
+    with the row order given by ``full_set.reverse_node_mapping`` (i.e. PyG node index -> neo4j id).
+    This is the single place where node features are materialised, so training and bootstrap reuse
+    exactly the same layout. A node whose attribute is missing contributes an all-zero row for that
+    block, so the width of X is fixed by the vocabulary but individual rows are not full one-hot
+    encodings. The degree channel (``dataset.use_attr_degree``) is exactly ONE column holding
+    log(1 + degree); it is appended LAST, so switching it on changes d -> d + 1 and therefore
+    invalidates every checkpoint that was trained without it.
     """
     reverse_node_mapping = full_set.reverse_node_mapping
     company_embeddings = full_set.company_embeddings
@@ -578,6 +706,16 @@ def assemble_node_features(full_set: CompanySupplyDataset) -> torch.Tensor:
         row_of = getattr(full_set, 'attr_onehot_row', {})
         extra = np.stack([matrix[row_of[reverse_node_mapping[i]]] for i in range(len(reverse_node_mapping))])
         features = np.concatenate([features, extra], axis=1)
+
+    degree_values = getattr(full_set, 'degree_values', None)
+    if degree_values is not None:
+        degree_values = np.asarray(degree_values, dtype=np.float32).reshape(-1)
+        if degree_values.shape[0] != features.shape[0]:
+            raise ValueError(
+                f"[Features] degree vector has {degree_values.shape[0]} rows but X has "
+                f"{features.shape[0]} nodes - the degree channel cannot be aligned"
+            )
+        features = np.concatenate([features, np.log1p(degree_values).reshape(-1, 1)], axis=1)
 
     return torch.tensor(features, dtype=torch.float)
 

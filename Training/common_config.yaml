@@ -31,6 +31,21 @@ dataset:
     - industry_2nd
     - category_3rd
 
+  # --- Node feature: degree channel log(1 + degree) ---
+  # true -> ONE extra column is appended to X, so
+  #         X = [embedding | one-hot(...) | log1p(degree)]   (701 -> 702 with the attrs above).
+  # `degree` = number of incident (source, target, year) triples in 2013-2025 counted on BOTH
+  # endpoints, restricted by `source_filter` - i.e. exactly the quantity `min_degree` thresholds
+  # on, so the two are on the same scale. It is read from the Neo4j node property `degree_property`;
+  # if that property is missing (or only partially filled) the dataset computes it once and writes
+  # it back to Neo4j before the first feature assembly, so later runs just read it.
+  # DESIGN CAVEAT: the degree is a whole-window, transductive statistic - it is computed from ALL
+  # positives of the window, including the val/test edges. A run with use_attr_degree=true is
+  # therefore NOT comparable with the no-degree baseline on val/test metrics; use it to test whether
+  # degree information helps at all, not to claim a better model.
+  use_attr_degree: false
+  degree_property: degree        # Neo4j property that stores the degree (created on demand)
+
 # --- Model architecture: the parts shared by every backbone ---
 # Inherited by every Models/configs/{model}.yaml through the deep merge, so the shared node-feature
 # extractor has exactly ONE editable location. A model that needs a different extractor re-declares
@@ -57,7 +72,7 @@ toy_mode: false                     # enable toy mode (quick validation on a sma
 # Training/config_loader.py. If selection.patience is left empty, the trainers fall back to their
 # built-in default (EARLY_STOP_PATIENCE_DEFAULT = 10 in Training/trainer_common.py) and warn.
 trainer:
-  num_epochs: 60                    # epoch ceiling (runs normally stop earlier via early stopping)
+  num_epochs: 30                    # epoch ceiling (runs normally stop earlier via early stopping)
   max_factset_edges: 5000           # factset sampling cap (null=all)
 
   # --- Model selection + early stopping: ONE unified criterion (see Training/trainer_common.py) ---
@@ -70,7 +85,7 @@ trainer:
     use_factset: false              # false = select on the ranking metric only (FSQ still logged)
     metric: auc                     # auc | f1, computed on the selection split (val when available)
     ema_span: 5                     # exponential-moving-average span; <=1 disables the smoothing
-    patience: 15                    # early-stopping budget (epochs); THE ONLY patience knob
+    patience: 10                    # early-stopping budget (epochs); THE ONLY patience knob
                                     # empty -> built-in default 10 (with a warning)
                                     # keep it > lr_schedule.plateau_patience
 
@@ -110,7 +125,7 @@ trainer:
     # the hinge keeps pushing pairs towards the saturation corners and defeats part of the effect:
     # lower `margin` to at most 1 - 2*eps (e.g. <= 0.9 for eps = 0.05). The trainer warns when the
     # two are not in step.
-    label_smoothing: 0.0
+    label_smoothing: 0.1
 
 # --- Pretrained model loading ---
 # If a pretrained model path is provided, its feature extractor (static_encoder/static_gnn)

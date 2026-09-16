@@ -1,0 +1,62 @@
+# ============================================================
+# GAT-GRU-Vec + degree channel
+# 实验 A（唯一变量）：dataset.use_attr_degree = true -> X 末尾多一列 log(1+degree)
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 与 gatgru_vec.yaml 的差别只有一处：`dataset.use_attr_degree: true`
+#   X = [embedding(128) | one-hot(country|industry_2nd|category_3rd) | log1p(degree)]
+#   = 701 -> 702。架构、传播方向、训练协议全部不变，因此两份 run 只差这一列。
+#
+# 为什么需要它：本项目所有聚合器都是 mean 类（GAT = softmax 加权平均），对邻域基数不变，
+# 只能表达"邻域构成比例"，表达不了"有多少个邻居"；度只能靠显式通道喂进去。
+#
+# 跑之前必读（TechnicalGuide.md §3.5）：
+#   * degree = 2013-2025 窗口内 (source, target, year) 三元组在两端分别计数的次数，
+#     受 source_filter 约束，与 min_degree 过滤用的是同一个量（同尺度）。
+#     它读 Neo4j 节点属性 `degree_property`；缺失时数据集先算一次再按 5000 条一批写回，
+#     所以只有第一次 run 付这个代价，之后各入口（训练 / bootstrap / 插补）直接读。
+#   * 度是全窗口的传导式（transductive）统计量 —— 含 val/test 边。因此本 run **不能**
+#     与关闭该开关的 baseline 在 val/test 指标上并列比较；它只回答"度信息有没有用"。
+#   * X 宽了一列 ⇒ 所有旧 ckpt（含 backbone.pth）失效，必须重训。
+#   * source_filter 为空时会扫全库（插补库 10^8 量级关系），代码会打 WARNING。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8；否则会写进 results/gatgru/）：
+#   python SampleSetting/run_sampling.py -c gatgru_vec_deg -s gatgru_vec_deg -d cuda:0
+# ============================================================
+
+name: GAT-GRU-Vec+Deg
+output_subdir: gatgru_vec_deg
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+  # --- 实验开关（覆盖 common_config.yaml 的同名键，模型文件赢）---
+  use_attr_degree: true
+  degree_property: degree        # Neo4j 属性名；缺省则为 'degree'
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # 传播方向沿用基线（source_to_target = 聚合供应商/入邻），见 gatgru_vec.yaml
+    message_direction: source_to_target
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

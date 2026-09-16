@@ -118,23 +118,47 @@ class GATEncoderVectorized(nn.Module):
 
     GAT attention depends on the node features at both ends of every edge, and the edge set
     differs across time steps, so it cannot be fully vectorized the way GCN can.
+
+    ``message_direction`` (PyG's ``flow`` argument, exposed as ``model.kwargs.message_direction``)
+    decides which endpoint of a directed edge is the one being updated:
+
+        'source_to_target' (default, historical GAT-GRU behaviour)
+            messages travel supplier -> customer, so a node aggregates its SUPPLIERS
+            (= its in-neighbours / the upstream side).
+        'target_to_source'
+            messages travel customer -> supplier, so a node aggregates its CUSTOMERS
+            (= its out-neighbours / the downstream side). This is the direction the
+            hand-written GCN path (``precompute_adj_matrices`` + ``torch.sparse.mm``, used by
+            Node-GRU / TNA / EGCN) has always used.
+
+    Only the direction of the message passing changes - the parameter shapes and therefore the
+    checkpoint layout stay identical, so the two settings are directly comparable.
     """
+    MESSAGE_DIRECTIONS = ('source_to_target', 'target_to_source')
+
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3, heads=4,
-                 use_checkpoint=True):
+                 use_checkpoint=True, message_direction='source_to_target'):
         super().__init__()
         self.num_layers = num_layers
         self.dropout = dropout
         self.heads = heads
         self.use_checkpoint = use_checkpoint
+        if message_direction not in self.MESSAGE_DIRECTIONS:
+            raise ValueError(
+                f"message_direction must be one of {self.MESSAGE_DIRECTIONS}, got {message_direction!r}"
+            )
+        self.message_direction = message_direction
 
         self.convs = nn.ModuleList()
         current_dim = input_dim
         for i in range(num_layers):
             if i == num_layers - 1:
-                conv = GATConv(current_dim, output_dim, heads=1, concat=False, dropout=dropout)
+                conv = GATConv(current_dim, output_dim, heads=1, concat=False, dropout=dropout,
+                               flow=message_direction)
                 current_dim = output_dim
             else:
-                conv = GATConv(current_dim, hidden_dim, heads=heads, dropout=dropout)
+                conv = GATConv(current_dim, hidden_dim, heads=heads, dropout=dropout,
+                               flow=message_direction)
                 current_dim = hidden_dim * heads
             self.convs.append(conv)
 

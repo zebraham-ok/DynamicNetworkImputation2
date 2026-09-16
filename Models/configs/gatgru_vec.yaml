@@ -25,6 +25,17 @@ model:
     time_steps: auto
     device: auto
     use_checkpoint: true
+    # --- Direction of the GAT message passing (GATEncoderVectorized.message_direction,
+    #     forwarded to PyG's GATConv `flow`) - the two values are the two experiments: ---
+    #   source_to_target : messages travel supplier -> customer, so a node aggregates its
+    #                      SUPPLIERS (in-neighbours / upstream). DEFAULT - reproduces every
+    #                      existing GAT-GRU checkpoint.
+    #   target_to_source : messages travel customer -> supplier, so a node aggregates its
+    #                      CUSTOMERS (out-neighbours / downstream) - the direction the
+    #                      hand-written GCN path (Node-GRU / TNA / EGCN) has always used.
+    # Parameter shapes are identical in both cases, so the two runs are directly comparable
+    # (same seed, same split); only the aggregation side changes.
+    message_direction: source_to_target
     # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
     # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
 

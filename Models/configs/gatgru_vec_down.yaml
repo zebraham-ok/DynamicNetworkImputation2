@@ -1,0 +1,54 @@
+# ============================================================
+# GAT-GRU-Vec, downstream aggregation
+# 实验 B（唯一变量）：model.kwargs.message_direction = target_to_source
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 与 gatgru_vec.yaml 的差别只有一处：GAT 的消息传播方向反过来。
+#   source_to_target（基线）：消息 supplier -> customer，节点聚合的是**供应商 / 入邻**（上游）
+#   target_to_source（本文件）  ：消息 customer -> supplier，节点聚合的是**客户 / 出邻**（下游）
+# 后者与手写 GCN 路径（Node-GRU / TNA / EGCN 的 precompute_adj_matrices 按行传播）同向，
+# 也就是说这份 config 把 GAT 家族的口径对齐到 GCN 家族，方便跨 backbone 做同口径比较。
+#
+# 参数形状与 state_dict 键完全一致 ⇒ 两份 run 可直接对照（同 seed、同 split、同 ckpt 可互换加载）。
+# 注意度归一化口径的**另一处**差异（不属于本开关）：PyG GCNConv 用入度归一化，我们手写的
+# precompute_adj_matrices 用出度；有向图上两者不同，写论文描述"度"时必须说明 in / out。
+#
+# 度的通道仍是关的（use_attr_degree 继承 common 的 false）⇒ 与基线同一 X（701）。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   python SampleSetting/run_sampling.py -c gatgru_vec_down -s gatgru_vec_down -d cuda:0
+# ============================================================
+
+name: GAT-GRU-Vec-Down
+output_subdir: gatgru_vec_down
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 1
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # --- 实验开关（GATConv 的 flow；非法值构造即 ValueError）---
+    message_direction: target_to_source
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

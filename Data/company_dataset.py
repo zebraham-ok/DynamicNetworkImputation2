@@ -50,6 +50,10 @@ def dataset_feature_kwargs(ds_cfg: dict) -> dict:
     return {
         'use_attr_onehot': ds_cfg.get('use_attr_onehot', False),
         'onehot_attrs': ds_cfg.get('onehot_attrs', None),
+        # Degree channel: one extra column log(1 + degree). See Training/common_config.yaml
+        # (dataset.use_attr_degree) - it changes the width of X, hence every checkpoint.
+        'use_attr_degree': ds_cfg.get('use_attr_degree', False),
+        'degree_property': ds_cfg.get('degree_property', 'degree'),
     }
 
 
@@ -69,6 +73,8 @@ def create_bootstrap_datasets(
     toy_mode: bool = False,
     use_attr_onehot: bool = False,
     onehot_attrs: list = None,
+    use_attr_degree: bool = False,
+    degree_property: str = 'degree',
 ):
     """Create the three-way bootstrap data split (full / test / val / train_pool).
 
@@ -77,7 +83,8 @@ def create_bootstrap_datasets(
     when False the file is not read at all. It has nothing to do with the val/test fixed negatives,
     which are always used.
     """
-    feature_kwargs = {'use_attr_onehot': use_attr_onehot, 'onehot_attrs': onehot_attrs}
+    feature_kwargs = {'use_attr_onehot': use_attr_onehot, 'onehot_attrs': onehot_attrs,
+                      'use_attr_degree': use_attr_degree, 'degree_property': degree_property}
 
     full_dataset = CompanySupplyDataset(
         negative_ratio=0,
@@ -372,6 +379,11 @@ def _share_metadata(dataset, source):
     dataset.attr_onehot_vocabs = getattr(source, 'attr_onehot_vocabs', {})
     dataset.attr_onehot_sizes = getattr(source, 'attr_onehot_sizes', {})
     dataset.attr_onehot_dim = getattr(source, 'attr_onehot_dim', 0)
+    # Degree channel: indexed by PyG node index, so it can be shared as-is (the splits share
+    # node_mapping). Only full_dataset queries Neo4j; every other split reuses these values.
+    dataset.use_attr_degree = getattr(source, 'use_attr_degree', False)
+    dataset.degree_property = getattr(source, 'degree_property', 'degree')
+    dataset.degree_values = getattr(source, 'degree_values', None)
 
 
 # Study-window year range (global constants)
@@ -672,7 +684,8 @@ def create_dataloaders(negative_ratio=1, embedding_name="embedding",
                        random_state=None, min_degree=2, source_filter='semi',
                        other_possible_fill=0.0, filter_factset_neg=False,
                        intra_industry_neg=True, use_pred_neg=True, neg_dir=None,
-                       use_attr_onehot=False, onehot_attrs=None):
+                       use_attr_onehot=False, onehot_attrs=None,
+                       use_attr_degree=False, degree_property='degree'):
     """Create train/val/test data loaders, returning (static_data, train_loader, val_loader, test_loader, full_dataset)."""
     bootstrap_data = create_bootstrap_datasets(
         negative_ratio=negative_ratio,
@@ -690,6 +703,8 @@ def create_dataloaders(negative_ratio=1, embedding_name="embedding",
         toy_mode=toy_mode,
         use_attr_onehot=use_attr_onehot,
         onehot_attrs=onehot_attrs,
+        use_attr_degree=use_attr_degree,
+        degree_property=degree_property,
     )
 
     # Standard training: use all of train_pool, no bootstrap resampling

@@ -156,7 +156,7 @@ class TemporalInjectionGATGRU(nn.Module):
     def __init__(self, dynamic_data, static_hidden_dim, dynamic_hidden_dim,
                  num_gat_layers=2, num_rnn_layers=1, dropout=0.3,
                  time_steps=list(range(2013, 2026)), device=None, heads=4,
-                 use_checkpoint=True,
+                 use_checkpoint=True, message_direction='source_to_target',
                  use_fc_embedding=True, fc_embed_dim=128, fc_hidden_dim=None, fc_num_layers=3,
                  activation=None, detach_global=True, use_adjacency=True,
                  residual_injection=True):
@@ -207,6 +207,7 @@ class TemporalInjectionGATGRU(nn.Module):
             dropout=dropout,
             heads=heads,
             use_checkpoint=use_checkpoint,
+            message_direction=message_direction,
         )
 
         # A_t for the second (injection) aggregation, through the SAME implementation as

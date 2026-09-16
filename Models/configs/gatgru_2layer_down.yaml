@@ -1,0 +1,49 @@
+# ============================================================
+# GAT-GRU* (2-layer BiGRU), downstream aggregation
+# 实验 B（唯一变量）：model.kwargs.message_direction = target_to_source
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 与 gatgru_2layer.yaml 的差别只有一处：GAT 消息传播方向反过来。
+#   source_to_target（基线）：聚合**供应商 / 入邻**（上游）
+#   target_to_source（本文件）  ：聚合**客户 / 出邻**（下游），与手写 GCN 路径同向
+# 参数形状与 state_dict 键不变 ⇒ 与基线可直接对照（同 seed、同 split）。
+#
+# 度的通道仍关（继承 common 的 false）⇒ X 与基线同为 701。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   python SampleSetting/run_sampling.py -c gatgru_2layer_down -s gatgru_2layer_down -d cuda:0
+# ============================================================
+
+name: GAT-GRU*-Vec-Down
+output_subdir: gatgru_2layer_down
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+
+model:
+  module: Models.gatgru_vectorized
+  class: BiGRUImputationWithGATVectorized
+  kwargs:
+    static_hidden_dim: 128
+    dynamic_hidden_dim: 64
+    num_gat_layers: 2
+    num_rnn_layers: 2            # <- GAT-GRU* 的定义（1 层是 gatgru_vec）
+    dropout: 0.3
+    heads: 4
+    time_steps: auto
+    device: auto
+    use_checkpoint: true
+    # --- 实验开关（GATConv 的 flow；非法值构造即 ValueError）---
+    message_direction: target_to_source
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]
