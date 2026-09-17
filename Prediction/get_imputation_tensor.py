@@ -146,6 +146,25 @@ def load_imputation_config(cli_config: Optional[str] = None) -> dict:
 
 # Embedding precomputation / cache
 
+def apply_backbone_feature_extractor(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Project raw node features through the backbone's shared feature extractor (no-op if none).
+
+    GAT-GRU style backbones build ``static_encoder`` with ``input_dim = fc_embed_dim`` (128) and
+    project X (701) down to that width with ``feature_extractor`` first
+    (``Models/gatgru_vectorized.py::forward``). Feeding ``model.raw_node_feats`` straight into
+    ``static_encoder`` raises ``mat1 and mat2 shapes cannot be multiplied (N x 701 and 128 x 512)``,
+    which made the whole embedding cache fall back to the slow per-batch forward.
+    """
+    extractor = getattr(model, 'feature_extractor', None)
+    if extractor is None:
+        # Older/other backbones may name it differently; a missing extractor simply means the
+        # encoder consumes raw features directly.
+        extractor = getattr(model, 'fc_embedding', None)
+    if extractor is None:
+        return x
+    return extractor(x)
+
+
 class EmbeddingCache:
     """Dynamic embedding precomputation cache manager (same as get_imputation.py)"""
 
@@ -223,6 +242,14 @@ class EmbeddingCache:
             print(f"[EmbeddingCache] Embedding computation failed: {e}")
             import traceback
             traceback.print_exc()
+            # This is NOT a harmless fallback: without the cache every batch re-runs the whole
+            # graph encoder + temporal encoder, which is 1-2 orders of magnitude slower.
+            if self.is_compatible():
+                print("[EmbeddingCache][WARN] Falling back to per-batch forward inference: "
+                      "the full graph encoder is re-executed for EVERY batch "
+                      "(measured ~1.8k pairs/s vs ~130k pairs/s with the cache). "
+                      "Consider Ctrl-C and fixing the error above, or pass --batch-size 32768 "
+                      "to at least amortise it.")
             return None
 
     def compute_embeddings(self, device: torch.device) -> torch.Tensor:
@@ -231,12 +258,15 @@ class EmbeddingCache:
         with torch.no_grad():
             if hasattr(model, 'static_encoder') and hasattr(model, 'raw_node_feats'):
                 encoder = model.static_encoder
+                # Must match the backbone's own forward(): project X through the shared
+                # feature extractor first, otherwise the GAT/GRU input width is wrong.
+                node_feats = apply_backbone_feature_extractor(model, model.raw_node_feats)
                 if hasattr(model, 'adj_matrices'):
-                    static_sequence = encoder(model.adj_matrices, model.raw_node_feats)
+                    static_sequence = encoder(model.adj_matrices, node_feats)
                 elif hasattr(model, 'edge_index_list'):
-                    static_sequence = encoder(model.edge_index_list, model.raw_node_feats)
+                    static_sequence = encoder(model.edge_index_list, node_feats)
                 else:
-                    static_sequence = encoder(model.raw_node_feats)
+                    static_sequence = encoder(node_feats)
             elif hasattr(model, 'subgraphs') and hasattr(model, 'static_encoder'):
                 time_embeddings = []
                 for subgraph in model.subgraphs:
