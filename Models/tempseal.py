@@ -204,8 +204,20 @@ class SEALWithTemporalWeighting(nn.Module):
     def __init__(self, num_features, hidden_dim, k_hop=2, batch_size=32, 
                  gcn_dropout=0.3, edge_dropout=0.1,
                  device='cuda' if torch.cuda.is_available() else 'cpu',
+                 message_direction='source_to_target',
                  use_fc_embedding=True, fc_embed_dim=128, fc_hidden_dim=None, fc_num_layers=3):
         super().__init__()
+        # Direction switch, accepted only so that the shared Training/common_config.yaml
+        # model.kwargs block can be handed to every backbone without special-casing SEAL.  SEAL
+        # aggregates with GCNConv on k-hop subgraphs and GCNConv has no `flow` argument, so its
+        # direction is fixed to source_to_target (the same side the new shared default uses).
+        # Anything else would be silently ignored, so it is rejected loudly instead.
+        if message_direction != 'source_to_target':
+            raise ValueError(
+                "Temp-SEAL aggregates through GCNConv on k-hop subgraphs, which has no `flow` "
+                "argument and is therefore fixed to 'source_to_target'; got "
+                f"message_direction={message_direction!r}."
+            )
         self.batch_size = batch_size
         self.edge_dropout = edge_dropout
         self.subgraph_extractor = BatchSubgraphExtractor(k_hop=k_hop, batch_size=batch_size, device=device)

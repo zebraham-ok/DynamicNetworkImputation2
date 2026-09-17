@@ -79,6 +79,39 @@ DEFAULT_SELECTION_CFG = {
 # triggers a warning in DynamicGraphTrainer.__init__.
 EARLY_STOP_PATIENCE_DEFAULT = 10
 
+
+def partition_scores(preds_np, labels_np, scope, warn=True):
+    """Split scores into (all, positive, negative) using a 0.5 label threshold.
+
+    Shared by DynamicGraphTrainer and SEALTrainer so both trainers partition a split identically.
+
+    Until 2026-09-16 both trainers used an exact `labels == 1` / `labels == 0` comparison, which is
+    silently fragile: it returns two EMPTY arrays for any label layout that is not exactly the float
+    0.0 / 1.0 (soft labels, a permuted or mis-shaped label vector). An empty positive/negative split
+    made every `wasserstein_*` key drop out of the FactSet result dict, which is why summary.yaml
+    reported a permanent null for those columns. The threshold form is identical for hard 0/1 labels.
+
+    It also guards the length mismatch a per-batch loader can produce when a model drops invalid
+    timesteps from a batch: without it the boolean mask either raises (the mask does not match the
+    indexed array) or silently lines the wrong labels up with the scores.
+    """
+    if preds_np.shape[0] != labels_np.shape[0]:
+        keep = min(preds_np.shape[0], labels_np.shape[0])
+        if warn:
+            print(f"[Factset][WARN] {scope}: {preds_np.shape[0]} scores vs "
+                  f"{labels_np.shape[0]} labels - truncating both to {keep}")
+        preds_np = preds_np[:keep]
+        labels_np = labels_np[:keep]
+
+    pos_mask = labels_np > 0.5
+    neg_mask = ~pos_mask
+    if warn and labels_np.size and (not pos_mask.any() or not neg_mask.any()):
+        print(f"[Factset][WARN] {scope}: degenerate labels "
+              f"(min={float(labels_np.min()):.4g}, max={float(labels_np.max()):.4g}, "
+              f"{int(pos_mask.sum())} positive / {int(neg_mask.sum())} negative)")
+    return (preds_np.tolist(), preds_np[pos_mask].tolist(), preds_np[neg_mask].tolist())
+
+
 # --- Learning-rate schedule defaults ---------------------------------------------------------
 # Disabled by default: a constant learning rate equal to base_lr (the historical behaviour).
 DEFAULT_LR_SCHEDULE_CFG = {
@@ -489,13 +522,23 @@ class DynamicGraphTrainer:
         if self.use_tensorboard and epoch is not None:
             self.writer.add_scalar(f'{monitor}/Factset_Quantile', quantile, epoch)
 
-        result = {'quantile': quantile, 'scope': scope}
-        if wass_pos is not None:
-            result['wasserstein_pos'] = wass_pos
-        if wass_neg is not None:
-            result['wasserstein_neg'] = wass_neg
-        if wass_diff is not None:
-            result['wasserstein_diff'] = wass_diff
+        # Publish the Wasserstein keys ALWAYS, None included: an absent key used to be
+        # indistinguishable from "not computable", so every run silently reported null in
+        # summary.yaml. The sample counts make a degenerate split visible there as well.
+        result = {
+            'quantile': quantile,
+            'scope': scope,
+            'wasserstein_pos': wass_pos,
+            'wasserstein_neg': wass_neg,
+            'wasserstein_diff': wass_diff,
+            'n_factset': int(len(factset_scores)),
+            'n_scores_all': int(len(scores_all)),
+            'n_scores_pos': int(len(pos_scores)),
+            'n_scores_neg': int(len(neg_scores)),
+        }
+        if wass_diff is None:
+            print(f"[Factset][WARN] {split_label}: Wasserstein not computable at epoch {epoch} "
+                  f"(factset={len(factset_scores)}, pos={len(pos_scores)}, neg={len(neg_scores)})")
         return result
 
     def _factset_edge_scores(self, epoch=None, max_factset_edges=None):
@@ -541,15 +584,20 @@ class DynamicGraphTrainer:
 
         Reuses the cached evaluate() pass when available, so the FactSet statistics describe
         exactly the same sample set as the reported metrics instead of a second inference pass.
+
+        The label partition uses a 0.5 threshold instead of the `== 1` / `== 0` exact comparison
+        used until 2026-09-16. That comparison is silently fragile: it yields two EMPTY arrays for
+        any label layout that is not exactly the float 0.0 / 1.0 (soft labels, a permuted or
+        mis-shaped label vector), and an empty positive/negative split made all three
+        `wasserstein_*` keys drop out of the result dict - which is why summary.yaml reported a
+        permanent null for them. The threshold form is identical for hard 0/1 labels.
         """
         cached = self._eval_scores.get(scope)
         if cached is not None:
             preds, labels = cached
             preds_np = preds.detach().cpu().numpy().flatten()
             labels_np = labels.detach().cpu().numpy().flatten()
-            return (preds_np.tolist(),
-                    preds_np[labels_np == 1].tolist(),
-                    preds_np[labels_np == 0].tolist())
+            return partition_scores(preds_np, labels_np, scope)
 
         scores_all, pos_scores, neg_scores = [], [], []
         with torch.no_grad():
@@ -561,9 +609,17 @@ class DynamicGraphTrainer:
                 if len(predictions) > 0:
                     preds_np = predictions.cpu().numpy().flatten()
                     labels_np = labels.cpu().numpy().flatten()
-                    scores_all.extend(preds_np.tolist())
-                    pos_scores.extend(preds_np[labels_np == 1].tolist())
-                    neg_scores.extend(preds_np[labels_np == 0].tolist())
+                    batch_all, batch_pos, batch_neg = partition_scores(
+                        preds_np, labels_np, scope, warn=False)
+                    scores_all.extend(batch_all)
+                    pos_scores.extend(batch_pos)
+                    neg_scores.extend(batch_neg)
+
+        # One aggregated warning per split instead of one per batch
+        if scores_all and (not pos_scores or not neg_scores):
+            print(f"[Factset][WARN] {scope}: label partition is degenerate after scoring "
+                  f"{len(scores_all)} samples ({len(pos_scores)} positive / "
+                  f"{len(neg_scores)} negative); Wasserstein stays None.")
         return scores_all, pos_scores, neg_scores
 
     @staticmethod
@@ -572,15 +628,21 @@ class DynamicGraphTrainer:
         if result is None:
             return []
         lines = [f"Factset quantile ({split_label}): {result['quantile']:.4f} (higher is better)"]
-        if 'wasserstein_pos' in result:
+        # The Wasserstein keys are always present now and may legitimately hold None (degenerate
+        # label partition, see _split_scores), so test the VALUE, not the key.
+        if result.get('wasserstein_pos') is not None:
             lines.append(f"Wasserstein ({split_label}, Factset vs positives): "
                          f"{result['wasserstein_pos']:.6f} (smaller is more similar)")
-        if 'wasserstein_neg' in result:
+        if result.get('wasserstein_neg') is not None:
             lines.append(f"Wasserstein ({split_label}, Factset vs negatives): "
                          f"{result['wasserstein_neg']:.6f} (smaller is more similar)")
-        if 'wasserstein_diff' in result:
+        if result.get('wasserstein_diff') is not None:
             lines.append(f"Wasserstein Diff ({split_label}, neg-pos): "
                          f"{result['wasserstein_diff']:.6f} (larger is better)")
+        else:
+            lines.append(f"Wasserstein ({split_label}): not computable "
+                         f"(pos={result.get('n_scores_pos', '?')}, "
+                         f"neg={result.get('n_scores_neg', '?')})")
         return lines
 
     @staticmethod

@@ -10,8 +10,13 @@ from Models.common import build_feature_extractor, apply_node_feature_extractor
 
 class EGCN_PyG(nn.Module):
     def __init__(self, dynamic_data, hidden_dims, activation=nn.ReLU(), 
-                 num_gru_layers=2, dropout=0.3, time_steps=None, device=None):
-        """hidden_dims: list of hidden dims per layer, e.g. [input_dim, hidden1, hidden2]."""
+                 num_gru_layers=2, dropout=0.3, time_steps=None, device=None,
+                 message_direction='source_to_target'):
+        """hidden_dims: list of hidden dims per layer, e.g. [input_dim, hidden1, hidden2].
+
+        message_direction: see Models/common_vectorized.precompute_adj_matrices.
+        source_to_target (default) aggregates the upstream suppliers.
+        """
         super().__init__()
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.time_steps = time_steps if time_steps else list(range(dynamic_data.edge_time.min(), 
@@ -32,7 +37,8 @@ class EGCN_PyG(nn.Module):
                 in_feats=hidden_dims[i-1],
                 out_feats=hidden_dims[i],
                 activation=activation,
-                dropout=dropout
+                dropout=dropout,
+                message_direction=message_direction
             )
             self.grcu_layers.append(grcu_layer)
         
@@ -131,6 +137,7 @@ class EGCN_PyG_Vectorized(nn.Module):
     """Vectorized version of EGCN, precomputes all adjacency matrices, plus the shared node-feature extractor"""
     def __init__(self, dynamic_data, hidden_dims, activation=nn.ReLU(), 
                  num_gru_layers=2, dropout=0.3, time_steps=None, device=None,
+                 message_direction='source_to_target',
                  use_fc_embedding=True, fc_embed_dim=128, fc_hidden_dim=None, fc_num_layers=3):
         super().__init__()
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -156,7 +163,7 @@ class EGCN_PyG_Vectorized(nn.Module):
             hidden_dims = [fc_embed_dim] + list(hidden_dims[1:])
         
         # Precompute the sparse adjacency matrices for all time steps
-        self.adj_matrices = self._precompute_adj_matrices(dynamic_data)
+        self.adj_matrices = self._precompute_adj_matrices(dynamic_data, message_direction)
         
         # Initialize GRCU layers
         self.grcu_layers = nn.ModuleList()
@@ -185,8 +192,23 @@ class EGCN_PyG_Vectorized(nn.Module):
         
         self.to(self.device)
     
-    def _precompute_adj_matrices(self, dynamic_data):
-        """Precompute the sparse adjacency matrices for all time steps"""
+    def _precompute_adj_matrices(self, dynamic_data, message_direction='source_to_target'):
+        """Precompute the sparse adjacency matrices for all time steps.
+
+        Direction semantics are the same as Models.common_vectorized.precompute_adj_matrices (the
+        loop is kept local only because this variant builds the empty-time-step matrix slightly
+        differently):
+            source_to_target -> a node aggregates its in-neighbours (the upstream suppliers),
+                                which is the shared default since 2026-09-16
+            target_to_source -> a node aggregates its out-neighbours (the downstream customers),
+                                the historical behaviour of this model
+        """
+        if message_direction not in ('source_to_target', 'target_to_source'):
+            raise ValueError(
+                "message_direction must be 'source_to_target' or 'target_to_source', got "
+                f"{message_direction!r}"
+            )
+
         adj_matrices = []
         
         for t in self.time_steps:
@@ -197,14 +219,19 @@ class EGCN_PyG_Vectorized(nn.Module):
                 # Symmetric normalization coefficients D^{-1/2} A D^{-1/2}
                 row, col = filtered_edge_index
                 num_edges = row.size(0)
-                
-                deg = torch.bincount(row, minlength=self.num_nodes).float()
+
+                if message_direction == 'source_to_target':
+                    walk_row, walk_col = col, row
+                else:
+                    walk_row, walk_col = row, col
+
+                deg = torch.bincount(walk_row, minlength=self.num_nodes).float()
                 deg_inv_sqrt = deg.pow(-0.5)
                 deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-                norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+                norm = deg_inv_sqrt[walk_row] * deg_inv_sqrt[walk_col]
                 
                 adj = torch.sparse_coo_tensor(
-                    filtered_edge_index,
+                    torch.stack([walk_row, walk_col]),
                     norm,
                     size=(self.num_nodes, self.num_nodes)
                 )
@@ -311,11 +338,13 @@ class GRCU_PyG_Vectorized(nn.Module):
 
 class GRCU_PyG(nn.Module):
     """PyG version of the GRCU layer"""
-    def __init__(self, in_feats, out_feats, activation, dropout=0.3):
+    def __init__(self, in_feats, out_feats, activation, dropout=0.3,
+                 message_direction='source_to_target'):
         super().__init__()
         self.in_feats = in_feats
         self.out_feats = out_feats
         self.activation = activation
+        self.message_direction = message_direction
         
         self.evolve_weights = MatGRUCell_PyG(rows=in_feats, cols=out_feats)
         
@@ -350,18 +379,24 @@ class GRCU_PyG(nn.Module):
             if num_edges > 0:
                 # GCN symmetric normalization coefficients
                 row, col = edge_index
+                if self.message_direction == 'source_to_target':
+                    # Aggregate in-neighbours: the target collects its suppliers' messages
+                    walk_row, walk_col = col, row
+                else:
+                    # Historical behaviour: the source collects its customers' messages
+                    walk_row, walk_col = row, col
                 deg = torch.zeros(num_nodes, device=node_feats.device)
-                deg = deg.scatter_add_(0, row, torch.ones(num_edges, device=node_feats.device))
+                deg = deg.scatter_add_(0, walk_row, torch.ones(num_edges, device=node_feats.device))
                 deg_inv_sqrt = deg.pow(-0.5)
                 deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-                norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+                norm = deg_inv_sqrt[walk_row] * deg_inv_sqrt[walk_col]
                 
                 transformed = node_feats @ gcn_weights  # [num_nodes, out_feats]
                 
                 # Manually implement GCN message passing
                 out = torch.zeros_like(transformed)
                 for i in range(num_edges):
-                    src, dst = col[i], row[i]
+                    src, dst = walk_col[i], walk_row[i]
                     out[dst] += transformed[src] * norm[i]
                 
                 out = out + transformed  # self-connection

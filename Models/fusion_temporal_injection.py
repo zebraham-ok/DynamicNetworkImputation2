@@ -213,7 +213,8 @@ class TemporalInjectionGATGRU(nn.Module):
         # A_t for the second (injection) aggregation, through the SAME implementation as
         # EvolveGCN-H rather than a private copy of the normalisation.
         self.adj_matrices = precompute_adj_matrices(
-            dynamic_data, time_steps, self.num_nodes, self.device
+            dynamic_data, time_steps, self.num_nodes, self.device,
+            message_direction=message_direction
         )
 
         # Temporal stack: evolve the operator on z, inject it into the attention output, then GRU.

@@ -30,11 +30,14 @@ trainer:
   type: standard
   module: Training.train_dualseal
   class: SEALTrainer
-  # NOTE: num_epochs is deliberately NOT set here. It is inherited from
-  # Training/common_config.yaml (trainer.num_epochs, currently 60) and acts as a safety ceiling
-  # only; the run normally stops earlier through early stopping, so Temp-SEAL is no longer capped
-  # at a few epochs (the historical `num_epochs: 2` left it severely under-trained and its metrics
-  # were not comparable with the other backbones).
+  # BUDGET EXCEPTION (2026-09-16): Temp-SEAL runs 10 epochs / patience 5, and it is the ONLY
+  # exception to the shared 30 / 10 budget in Training/common_config.yaml. One SEAL "epoch" is far
+  # more expensive than one epoch of the other backbones (k-hop subgraph extraction per link), so
+  # the epoch count is not comparable one-to-one; pinning the two numbers here keeps a SEAL row
+  # from being silently compared with a backbone row trained at a different budget.
+  num_epochs: 10
+  selection:
+    patience: 5
   kwargs:
     use_tensorboard: true
     lr: 0.001
@@ -43,10 +46,11 @@ trainer:
     # Fallback only: the validation split passed in from create_dataloaders takes precedence, and
     # this random_split of the training pool is used only when that split is unavailable.
     val_ratio: 0.1
-    # NOTE: patience is deliberately NOT set here either. Both trainers resolve the early-stopping
-    # budget from ONE key in Training/common_config.yaml: trainer.selection.patience (currently 15).
-    # The former top-level trainer.patience was removed on 2026-09-12 and is no longer read (when the
-    # key is left empty the built-in EARLY_STOP_PATIENCE_DEFAULT = 10 applies, with a warning).
+    # NOTE: patience is NOT set here. The early-stopping budget is resolved from ONE key,
+    # trainer.selection.patience, which this config overrides at the top of the trainer block
+    # (5, the documented SEAL exception to the shared 10). The former top-level trainer.patience was
+    # removed on 2026-09-12 and is no longer read (when the key is left empty the built-in
+    # EARLY_STOP_PATIENCE_DEFAULT = 10 applies, with a warning).
     # SEALTrainer counts it in EPOCHS without a new best step-level selection F1 (the same quantity
     # that drives its checkpoint).
     # LR schedule (ReduceLROnPlateau on the step-level selection metric). lr_patience counts

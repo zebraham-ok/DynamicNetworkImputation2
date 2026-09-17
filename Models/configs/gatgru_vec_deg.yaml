@@ -3,6 +3,13 @@
 # 实验 A（唯一变量）：dataset.use_attr_degree = true -> X 末尾多一列 log(1+degree)
 # Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
 # ============================================================
+# 2026-09-16 二次更新：度通道已改回 common_config.yaml 的默认 **关闭**（opt-in），
+# 因此本 config **再次**是唯一的度开关：与基线 gatgru_vec.yaml 只差 `use_attr_degree`，
+# 2×2 恢复为 2×2（度 on/off × up/down）；"度关"的对照格就是基线 gatgru_vec.yaml 本身。
+# 性质说明：它是"标签可分离性探针"，不是可选模型（泄漏实测：单列
+# min(log1p(deg_u),log1p(deg_v)) 当分数就有 AUC 0.984，与该模型 AUC 同量级，
+# 见 common_config.yaml 该键注释与 TechnicalGuide §3.5）。绝不能进论文结果表。
+#
 # 与 gatgru_vec.yaml 的差别只有一处：`dataset.use_attr_degree: true`
 #   X = [embedding(128) | one-hot(country|industry_2nd|category_3rd) | log1p(degree)]
 #   = 701 -> 702。架构、传播方向、训练协议全部不变，因此两份 run 只差这一列。

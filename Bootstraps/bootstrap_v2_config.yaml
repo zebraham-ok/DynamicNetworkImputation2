@@ -46,7 +46,13 @@ data:
   # Degree channel: true -> append one column log(1 + degree) to X (d -> d + 1). The degree is the
   # whole-window incident-triple count written to the Neo4j property `degree_property` on demand.
   # This config does NOT inherit Training/common_config.yaml, so keep the value in sync by hand.
-  # Transductive statistic (it also sees val/test edges) - do not compare with the no-degree run.
+  # WARNING: transductive statistic - it is computed from the same quantity `min_degree` filters on
+  # and it also sees the val/test edges, so the column alone separates the positives (measured
+  # degree-only AUC 0.984; see Training/common_config.yaml for the full note). Never compare such a
+  # run with a no-degree run, and never use it for a paper result.
+  # Kept in step with the 2026-09-16 (second revision) default of Training/common_config.yaml
+  # (use_attr_degree: false), so bootstrap rounds and the main backbones read the same X layout
+  # (d = 701). Switch both or neither.
   use_attr_degree: false
   degree_property: degree
 

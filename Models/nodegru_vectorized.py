@@ -16,6 +16,7 @@ class BiGRUImputationVectorized(nn.Module):
     def __init__(self, dynamic_data: Data, static_hidden_dim, dynamic_hidden_dim,
                  num_gcn_layers=2, num_rnn_layers=1, dropout=0.3,
                  time_steps=list(range(2013, 2026)), device=None,
+                 message_direction='source_to_target',
                  use_fc_embedding=True, fc_embed_dim=128, fc_hidden_dim=None, fc_num_layers=3):
         super().__init__()
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,9 +26,11 @@ class BiGRUImputationVectorized(nn.Module):
         self.num_nodes = dynamic_data.num_nodes
         node_feat_dim = dynamic_data.x.size(1)
 
-        # Precompute the sparse adjacency matrices
+        # Precompute the sparse adjacency matrices (message_direction: see precompute_adj_matrices;
+        # source_to_target = aggregate the upstream suppliers, the shared default)
         self.adj_matrices = precompute_adj_matrices(
-            dynamic_data, time_steps, self.num_nodes, self.device
+            dynamic_data, time_steps, self.num_nodes, self.device,
+            message_direction=message_direction
         )
         # Keep the raw node features
         self.raw_node_feats = dynamic_data.x.to(self.device)

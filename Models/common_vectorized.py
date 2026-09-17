@@ -18,22 +18,59 @@ from torch_geometric.nn import GATConv
 from Models.common import build_feature_extractor, apply_node_feature_extractor  # noqa: F401
 
 
-def precompute_adj_matrices(dynamic_data, time_steps, num_nodes, device):
-    """Precompute the normalized sparse adjacency matrices A_norm = D^{-1/2} A D^{-1/2} for all time steps; returns List[sparse_coo_tensor]."""
+# Aggregation-direction vocabulary shared by every hand-written GCN path. It mirrors
+# GATEncoderVectorized.MESSAGE_DIRECTIONS below and the same-named key in
+# Training/common_config.yaml (model.kwargs.message_direction).
+MESSAGE_DIRECTIONS = ('source_to_target', 'target_to_source')
+
+
+def precompute_adj_matrices(dynamic_data, time_steps, num_nodes, device,
+                            message_direction='source_to_target'):
+    """Precompute the normalized sparse adjacency matrices A_norm = D^{-1/2} A D^{-1/2} for all time steps; returns List[sparse_coo_tensor].
+
+    ``message_direction`` is the shared aggregation-direction switch
+    (``Training/common_config.yaml -> model.kwargs.message_direction``), the same value the GAT
+    path forwards to ``GATConv(flow=...)``:
+
+        'source_to_target' (default since 2026-09-16)
+            messages travel supplier -> customer, so a node aggregates its SUPPLIERS
+            (in-neighbours / the upstream side). Formally ``out[i] = sum_j A[i, j] x[j]`` with
+            ``i = target``, i.e. the textbook GCN normalisation (PyG's own ``gcn_norm`` uses the
+            in-degree the same way).
+        'target_to_source'
+            messages travel customer -> supplier, so a node aggregates its CUSTOMERS
+            (out-neighbours / the downstream side). This is what this module did before
+            2026-09-16 and is kept ONLY to reproduce that historical ablation.
+
+    Only which endpoint of a directed edge is updated changes; the produced matrices keep the
+    same shape (N, N), so every model reads them unchanged and the checkpoints stay comparable.
+    """
+    if message_direction not in MESSAGE_DIRECTIONS:
+        raise ValueError(
+            f"message_direction must be one of {MESSAGE_DIRECTIONS}, got {message_direction!r}"
+        )
+
     adj_matrices = []
     for t in time_steps:
         mask = dynamic_data.edge_time == t
         edge_index = dynamic_data.edge_index[:, mask]
 
         if edge_index.size(1) > 0:
-            row, col = edge_index
-            deg = torch.bincount(row, minlength=num_nodes).float()
+            row, col = edge_index  # row = supplier (source), col = customer (target)
+            if message_direction == 'source_to_target':
+                # Aggregate in-neighbours: the TARGET collects the messages of its SUPPLIERS
+                walk_row, walk_col = col, row
+            else:
+                # Historical behaviour: the SOURCE collects the messages of its CUSTOMERS
+                walk_row, walk_col = row, col
+
+            deg = torch.bincount(walk_row, minlength=num_nodes).float()
             deg_inv_sqrt = deg.pow(-0.5)
             deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+            norm = deg_inv_sqrt[walk_row] * deg_inv_sqrt[walk_col]
 
             adj = torch.sparse_coo_tensor(
-                edge_index, norm,
+                torch.stack([walk_row, walk_col]), norm,
                 size=(num_nodes, num_nodes)
             )
         else:

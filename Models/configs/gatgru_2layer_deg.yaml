@@ -3,6 +3,12 @@
 # 实验 A（唯一变量）：dataset.use_attr_degree = true -> X 末尾多一列 log(1+degree)
 # Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
 # ============================================================
+# 2026-09-16 二次更新：度通道已改回 common_config.yaml 的默认 **关闭**（opt-in），
+# 因此本 config **再次**是唯一的度开关：与基线 gatgru_2layer.yaml 只差 `use_attr_degree`。
+# 它是"标签可分离性探针"，不是可选模型（泄漏实测：单列 min(log1p(deg_u),log1p(deg_v)) 当分数
+# 就有 AUC 0.984，而本模型 0.975(ftf)/0.9885(fff)，增益全部由这一列解释；
+# 见 common_config.yaml 该键注释与 TechnicalGuide §3.5）。绝不能进论文结果表。
+#
 # 与 gatgru_2layer.yaml 的差别只有一处：`dataset.use_attr_degree: true`
 #   X = [embedding(128) | one-hot(...) | log1p(degree)] = 701 -> 702
 # 基线的 GAT-GRU*（results/四次双模式/ensemble/gatgru2layer/）在四个负采样模式上都不弱于

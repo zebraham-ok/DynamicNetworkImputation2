@@ -24,7 +24,7 @@ from tqdm import tqdm
 from Models.tempseal import SEALWithTemporalWeighting
 from torch.utils.tensorboard import SummaryWriter
 from utils import youden_f1max_thresholds
-from Training.trainer_common import EARLY_STOP_PATIENCE_DEFAULT
+from Training.trainer_common import EARLY_STOP_PATIENCE_DEFAULT, partition_scores
 
 
 class SEALTrainer:
@@ -326,13 +326,22 @@ class SEALTrainer:
         if self.use_tensorboard and step is not None:
             self.writer.add_scalar(f'{monitor}/Factset_Quantile', quantile, step)
 
-        result = {'quantile': quantile, 'scope': scope}
-        if wass_pos is not None:
-            result['wasserstein_pos'] = wass_pos
-        if wass_neg is not None:
-            result['wasserstein_neg'] = wass_neg
-        if wass_diff is not None:
-            result['wasserstein_diff'] = wass_diff
+        # Same contract as DynamicGraphTrainer: the Wasserstein keys are always present (None when
+        # they could not be computed) and the sample counts expose a degenerate split.
+        result = {
+            'quantile': quantile,
+            'scope': scope,
+            'wasserstein_pos': wass_pos,
+            'wasserstein_neg': wass_neg,
+            'wasserstein_diff': wass_diff,
+            'n_factset': int(len(factset_scores)),
+            'n_scores_all': int(len(split_scores)),
+            'n_scores_pos': int(len(pos_scores)),
+            'n_scores_neg': int(len(neg_scores)),
+        }
+        if wass_diff is None:
+            print(f"[Factset][WARN] {split_label}: Wasserstein not computable at step {step} "
+                  f"(factset={len(factset_scores)}, pos={len(pos_scores)}, neg={len(neg_scores)})")
         return result
 
     def _factset_edge_scores(self, step=None, max_factset_edges=None):
@@ -374,7 +383,11 @@ class SEALTrainer:
         return factset_scores
 
     def _score_loader_splits(self, loader, scope):
-        """All / positive / negative scores of one split."""
+        """All / positive / negative scores of one split.
+
+        Partitioned by the shared Training/trainer_common.partition_scores, so SEAL and
+        DynamicGraphTrainer always describe a split the same way (0.5 label threshold).
+        """
         scores_all, pos_scores, neg_scores = [], [], []
         with torch.no_grad():
             for link_indices, current_times, labels in tqdm(
@@ -385,21 +398,31 @@ class SEALTrainer:
                 if len(predictions) > 0:
                     preds_np = predictions.cpu().numpy().flatten()
                     labels_np = labels.cpu().numpy().flatten()
-                    scores_all.extend(preds_np.tolist())
-                    pos_scores.extend(preds_np[labels_np == 1].tolist())
-                    neg_scores.extend(preds_np[labels_np == 0].tolist())
+                    batch_all, batch_pos, batch_neg = partition_scores(
+                        preds_np, labels_np, scope, warn=False)
+                    scores_all.extend(batch_all)
+                    pos_scores.extend(batch_pos)
+                    neg_scores.extend(batch_neg)
+        if scores_all and (not pos_scores or not neg_scores):
+            print(f"[Factset][WARN] {scope}: label partition is degenerate after scoring "
+                  f"{len(scores_all)} samples ({len(pos_scores)} positive / "
+                  f"{len(neg_scores)} negative); Wasserstein stays None.")
         return scores_all, pos_scores, neg_scores
 
     @staticmethod
     def _split_sample_scores(preds, labels):
-        """(all, positive, negative) score lists from one raw evaluation pass."""
+        """(all, positive, negative) score lists from one raw evaluation pass.
+
+        Delegates to the shared partition_scores (0.5 label threshold) from
+        Training/trainer_common.py: the previous exact `== 1` / `== 0` comparison silently produced
+        empty positive/negative lists, which is what made every `wasserstein_*` field of the SEAL
+        runs a permanent null.
+        """
         if preds is None or len(preds) == 0:
             return [], [], []
         preds_np = preds.cpu().numpy().flatten()
         labels_np = labels.cpu().numpy().flatten()
-        return (preds_np.tolist(),
-                preds_np[labels_np == 1].tolist(),
-                preds_np[labels_np == 0].tolist())
+        return partition_scores(preds_np, labels_np, 'eval', warn=False)
 
     @staticmethod
     def _fmt_factset_report(result, split_label):
@@ -408,9 +431,14 @@ class SEALTrainer:
             return []
         lines = [f'  Factset Quantile ({split_label}): {result["quantile"]:.4f} '
                  f'(higher is better)']
-        if 'wasserstein_diff' in result:
+        # The key is always present now and may legitimately hold None, so test the VALUE.
+        if result.get('wasserstein_diff') is not None:
             lines.append(f'  Wasserstein Diff ({split_label}, Neg-Pos): '
                          f'{result["wasserstein_diff"]:.6f} (larger is better)')
+        else:
+            lines.append(f'  Wasserstein ({split_label}): not computable '
+                         f'(pos={result.get("n_scores_pos", "?")}, '
+                         f'neg={result.get("n_scores_neg", "?")})')
         return lines
 
     def _checkpoint_dict(self, epoch, select_metrics, test_metrics):

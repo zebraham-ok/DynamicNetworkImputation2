@@ -3,6 +3,9 @@
 # 实验 A × B 的交叉格：use_attr_degree = true 且 message_direction = target_to_source
 # Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
 # ============================================================
+# 2026-09-16 二次更新：度通道已改回 common_config.yaml 的默认 **关闭**（opt-in），因此本
+# config 再次是"度开 × down"的独立格（2×2 恢复）；度关的 down 格=gatgru_vec_down.yaml。
+#
 # 2×2 设计的第四格（其余三格：gatgru_vec / gatgru_vec_deg / gatgru_vec_down）。
 # 单独跑它意义有限，价值在于与另外三格组成完整的 2×2，用来看两个因素是否独立：
 #   X 宽度 701 -> 702（+log1p(degree)），传播方向改为聚合客户 / 出邻。

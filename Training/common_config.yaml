@@ -40,9 +40,21 @@ dataset:
   # if that property is missing (or only partially filled) the dataset computes it once and writes
   # it back to Neo4j before the first feature assembly, so later runs just read it.
   # DESIGN CAVEAT: the degree is a whole-window, transductive statistic - it is computed from ALL
-  # positives of the window, including the val/test edges. A run with use_attr_degree=true is
-  # therefore NOT comparable with the no-degree baseline on val/test metrics; use it to test whether
-  # degree information helps at all, not to claim a better model.
+  # positives of the window, INCLUDING the val/test edges - and it is the very same quantity that
+  # `min_degree` (2) thresholds on, so the column encodes the positive-inclusion rule itself.
+  # MEASURED LEAK (2026-09-16, _tmp_dump/leak_degree.py, positives vs the val/test fixed-negative
+  # distribution = uniform random pairs among the embedded companies): using the single column
+  # min(log1p(deg_u), log1p(deg_v)) AS the score already gives AUC 0.984 (0.936 after subtracting
+  # the sample's own edge; the bare [min(du,dv) >= 2] indicator alone gives 0.944), while the
+  # degree-channel model itself only reaches test AUC 0.975 (Intra-Indus) / 0.9885 (All-Rand).
+  # The whole "gain" is therefore explained by that one column, not by anything the model learned.
+  # DEFAULT (2026-09-16, second revision): false - OPT-IN ONLY. The only place it may be switched on
+  # is the ablation grid Models/configs/{gatgru_vec,gatgru_2layer}_deg*.yaml, where it is a
+  # separability probe ("can the label be told from degree alone"), NEVER a "better model" claim,
+  # and its val/test metrics must not be put next to a no-degree run or into the paper's result
+  # table. Everything that is not that ablation keeps the historical d = 701 layout.
+  # The width is part of the embedding-cache fingerprint: d = 701 checkpoints cannot be loaded into
+  # a d = 702 model, so toggling this key invalidates the ckpt / backbone.pth and needs a retrain.
   use_attr_degree: false
   degree_property: degree        # Neo4j property that stores the degree (created on demand)
 
@@ -55,6 +67,20 @@ dataset:
 # merging this file builds the identical module.
 model:
   kwargs:
+    # --- Direction of every message-passing aggregation (shared by ALL backbones) ---
+    #   source_to_target : messages travel supplier -> customer, so a node aggregates its
+    #                      SUPPLIERS (in-neighbours / upstream side). DEFAULT since 2026-09-16.
+    #                      GAT forwards it to GATConv(flow=...); the hand-written GCN path
+    #                      (Node-GRU / TNA / EGCN, plus the injection branch of GAT-GRU-TI)
+    #                      applies it inside Models/common_vectorized.precompute_adj_matrices.
+    #   target_to_source : messages travel customer -> supplier, so a node aggregates its
+    #                      CUSTOMERS (out-neighbours / downstream side). This is what the
+    #                      hand-written GCN path used before 2026-09-16; it is kept only to
+    #                      reproduce that historical ablation, never as a default.
+    # Only the aggregation side changes - the parameter shapes (and therefore the checkpoint
+    # layout) are identical, so the two settings stay directly comparable under one seed/split.
+    # A model YAML may override this key; see Models/configs/*_down.yaml for the explicit variant.
+    message_direction: source_to_target
     use_fc_embedding: true          # enable the shared node-feature extractor
     fc_embed_dim: 128               # output width handed to each model's spatial encoder
     fc_hidden_dim: 256              # hidden width of the extractor MLP (= fc_embed_dim * 2)
@@ -64,8 +90,12 @@ model:
 toy_mode: false                     # enable toy mode (quick validation on a small amount of data)
 
 # --- Trainer ---
-# Model configs should NOT cap this per model: num_epochs is only a ceiling that guarantees the run
-# terminates, while the effective stopping rule is the early-stopping budget below.
+# SHARED BUDGET (2026-09-16): 30 epochs / patience 10 for every backbone. num_epochs is only a
+# ceiling that guarantees the run terminates, while the effective stopping rule is the early-stopping
+# budget below; a model config must NOT cap it, with ONE documented exception - Temp-SEAL runs
+# 10 / 5 (Models/configs/seal.yaml), because one SEAL epoch costs far more than one epoch of the
+# other backbones (k-hop subgraph extraction per link), so its epoch count is not comparable
+# one-to-one. Any further exception belongs in this comment first, then in the model YAML.
 # EARLY STOPPING HAS EXACTLY ONE KNOB: trainer.selection.patience (below), read by both
 # DynamicGraphTrainer and SEALTrainer. The former top-level trainer.patience was removed on
 # 2026-09-12: nothing reads it any more, and a config that still sets it gets a warning from

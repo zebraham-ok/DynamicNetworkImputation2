@@ -20,13 +20,12 @@ info/
 *.pyg
 *.zip
 
-Analysis/figures/
-Analysis/figures_ci/
-Analysis/visualization/
-Analysis/visualization_ci/
-Analysis/npy_roc_output/
-Analysis/npy_roc_output_ci/
-Analysis/edge_imput_overlap_scan_results.json
-Analysis/edge_imput_overlap_ratio_by_probability.png
-Analysis/edge_imput_overlap_ratio_by_probability.svg
+# figure / table / npy dump directories: prefix match, so variants such as
+# figures_ci, visualization_ci, npy_roc_output_up_ci(_init) are covered too
+Analysis/figures*/
+Analysis/visualization*/
+Analysis/npy_roc_output*/
+# imputation-overlap scan: ignore every output whose name starts with these prefixes
+Analysis/edge_imput_overlap_scan_*
+Analysis/edge_imput_overlap_ratio_by_probability*
 Data/stopped_neg_sample.csv

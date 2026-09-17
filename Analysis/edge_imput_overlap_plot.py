@@ -12,9 +12,17 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-JSON_PATH = os.path.join(SCRIPT_DIR, "edge_imput_overlap_scan_results.json")
-OUT_PNG = os.path.join(SCRIPT_DIR, "edge_imput_overlap_ratio_by_probability.png")
-OUT_SVG = os.path.join(SCRIPT_DIR, "edge_imput_overlap_ratio_by_probability.svg")
+
+# Same switch as in edge_imput_overlap_scan.py: which imputation run to plot.
+MODEL = os.environ.get("IMPUT_SCAN_MODEL", "egcn_ftf_s45")
+
+JSON_PATH = os.path.join(SCRIPT_DIR, f"edge_imput_overlap_scan_results_{MODEL}.json")
+if not os.path.exists(JSON_PATH):  # legacy single-model file name
+    _legacy = os.path.join(SCRIPT_DIR, "edge_imput_overlap_scan_results.json")
+    if os.path.exists(_legacy):
+        JSON_PATH = _legacy
+OUT_PNG = os.path.join(SCRIPT_DIR, f"edge_imput_overlap_ratio_by_probability_{MODEL}.png")
+OUT_SVG = os.path.join(SCRIPT_DIR, f"edge_imput_overlap_ratio_by_probability_{MODEL}.svg")
 
 # Source of key thresholds (file exported by threshold_analysis, recording the probability thresholds for youden_j / f1_max / f2_max).
 # Defaults to results/bootstrap/<run>/threshold_analysis/; use the IMPUT_THRESHOLD_RUN

@@ -9,6 +9,14 @@ import json
 from datetime import datetime
 
 RESTRICT_INDUSTRY = True  # whether to consider only edges consistent with industry_network.json
+
+# The imputation model to analyse = the `model` property written on each imputed
+# SupplyProductTo edge (see Prediction/get_imputation_fast.py: MERGE ... {source, model}).
+# Change this constant (or set the IMPUT_SCAN_MODEL environment variable) to scan another
+# imputation run; everything downstream (thresholds, meta, output filename) follows it.
+MODEL = os.environ.get("IMPUT_SCAN_MODEL", "egcn_ftf_s45")
+print(f"Target imputation model (edge property r.model): {MODEL}")
+
 INDUS_NETWORK_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "info", "indus_network.json"
@@ -179,8 +187,11 @@ edge_keys_by_source = {}
 for source, edges in edges_by_source.items():
     edge_keys_by_source[source] = {(e['source'], e['target'], e['year']): e['probability'] for e in edges}
 
-# Start scanning at the minimum probability of GAT-GRU-Vec
-model_edges = edge_keys_by_source.get('GAT-GRU-Vec', {})
+# Start scanning at the minimum probability of MODEL
+model_edges = edge_keys_by_source.get(MODEL, {})
+if not model_edges:
+    print(f"\nWARNING: no edges found for model={MODEL!r}; available sources: {sorted_sources}")
+    print("         set MODEL (or the IMPUT_SCAN_MODEL env var) to one of them")
 if model_edges:
     min_probability = min(model_edges.values())
     min_threshold = np.floor(min_probability / SCAN_STEP) * SCAN_STEP
@@ -204,7 +215,7 @@ for zone_start, zone_end, dense_step in HIGH_DENSE_ZONES:
 threshold_set.add(1.0)
 probability_thresholds = np.array(sorted(threshold_set))
 
-print(f"\nMinimum probability of GAT-GRU-Vec: {min_probability:.4f}")
+print(f"\nMinimum probability of {MODEL}: {min_probability:.4f}")
 print(f"Threshold scan range: {min_threshold:.2f} to 1.00")
 print(f"  Base step: {SCAN_STEP}, total threshold points: {len(probability_thresholds)}")
 for zs, ze, ds in HIGH_DENSE_ZONES:
@@ -214,7 +225,7 @@ zone_counts = {f"[{zs},{ze}]": sum(1 for t in probability_thresholds if zs <= t 
 for zone, n in zone_counts.items():
     print(f"  Dense zone {zone}: {n} sample points")
 
-# Overlap ratios relative to GAT-GRU-Vec / factset / semi, and edge count per threshold
+# Overlap ratios relative to the target model / factset / semi, and edge count per threshold
 factset_overlap_on_imput_ratios = []
 semi_overlap_on_imput_ratios = []
 factset_overlap_on_factset_ratios = []
@@ -230,34 +241,34 @@ semi_total = len(semi_keys)
 print("\nProbability threshold scan analysis")
 
 for threshold in probability_thresholds:
-    # Keep GAT-GRU-Vec edges with probability >= threshold
-    bigru_edges = edge_keys_by_source.get('GAT-GRU-Vec', {})
-    bigru_keys = {key for key, prob in bigru_edges.items() if prob >= threshold}
+    # Keep MODEL edges with probability >= threshold
+    model_edges = edge_keys_by_source.get(MODEL, {})
+    model_keys = {key for key, prob in model_edges.items() if prob >= threshold}
 
-    if not bigru_keys:
+    if not model_keys:
         factset_overlap_on_imput_ratios.append(0.0)
         semi_overlap_on_imput_ratios.append(0.0)
         factset_overlap_on_factset_ratios.append(0.0)
         semi_overlap_on_semi_ratios.append(0.0)
         edge_counts.append(0)
-        print(f"\nThreshold {threshold:.2f}: GAT-GRU-Vec edge count is 0, skipping")
+        print(f"\nThreshold {threshold:.2f}: {MODEL} edge count is 0, skipping")
         continue
 
-    factset_overlap = bigru_keys & factset_keys
-    factset_overlap_on_imput = len(factset_overlap) / len(bigru_keys)
+    factset_overlap = model_keys & factset_keys
+    factset_overlap_on_imput = len(factset_overlap) / len(model_keys)
     factset_overlap_on_factset = len(factset_overlap) / factset_total
     factset_overlap_on_imput_ratios.append(factset_overlap_on_imput)
     factset_overlap_on_factset_ratios.append(factset_overlap_on_factset)
 
-    semi_overlap = bigru_keys & semi_keys
-    semi_overlap_on_imput = len(semi_overlap) / len(bigru_keys)
+    semi_overlap = model_keys & semi_keys
+    semi_overlap_on_imput = len(semi_overlap) / len(model_keys)
     semi_overlap_on_semi = len(semi_overlap) / semi_total
     semi_overlap_on_imput_ratios.append(semi_overlap_on_imput)
     semi_overlap_on_semi_ratios.append(semi_overlap_on_semi)
-    edge_counts.append(len(bigru_keys))
+    edge_counts.append(len(model_keys))
 
     print(f"\nThreshold {threshold:.2f}:")
-    print(f"  GAT-GRU-Vec edge count (prob>={threshold:.2f}): {len(bigru_keys)}")
+    print(f"  {MODEL} edge count (prob>={threshold:.2f}): {len(model_keys)}")
     print(f"  factset overlaps: {len(factset_overlap)} | of Imput: {factset_overlap_on_imput:.2%} | of FactSet: {factset_overlap_on_factset:.2%}")
     print(f"  semi overlaps:   {len(semi_overlap)} | of Imput: {semi_overlap_on_imput:.2%} | of IC-SPLC: {semi_overlap_on_semi:.2%}")
 
@@ -327,10 +338,10 @@ if 'youden_j' in key_thresholds_data:
         zoom_semi_ds = []
         zoom_edge_counts = []
 
-        bigru_edges = edge_keys_by_source.get('GAT-GRU-Vec', {})
+        model_edges = edge_keys_by_source.get(MODEL, {})
         for threshold in zoom_thresholds:
-            bigru_keys = {key for key, prob in bigru_edges.items() if prob >= threshold}
-            if not bigru_keys:
+            model_keys = {key for key, prob in model_edges.items() if prob >= threshold}
+            if not model_keys:
                 zoom_factset_imp.append(0.0)
                 zoom_semi_imp.append(0.0)
                 zoom_factset_ds.append(0.0)
@@ -338,9 +349,9 @@ if 'youden_j' in key_thresholds_data:
                 zoom_edge_counts.append(0)
                 continue
 
-            n_edges = len(bigru_keys)
-            fo = len(bigru_keys & factset_keys)
-            so = len(bigru_keys & semi_keys)
+            n_edges = len(model_keys)
+            fo = len(model_keys & factset_keys)
+            so = len(model_keys & semi_keys)
             zoom_factset_imp.append(fo / n_edges)
             zoom_semi_imp.append(so / n_edges)
             zoom_factset_ds.append(fo / factset_total)
@@ -388,12 +399,13 @@ if 'youden_j' in key_thresholds_data:
         print(f"\nYouden's J threshold={t_youden:.4f} <= {ZOOM_TRIGGER_THRESHOLD}, zoom-in scan not triggered")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-JSON_PATH = os.path.join(SCRIPT_DIR, "edge_imput_overlap_scan_results.json")
+# One result file per MODEL so that scans of different imputation runs do not overwrite each other
+JSON_PATH = os.path.join(SCRIPT_DIR, f"edge_imput_overlap_scan_results_{MODEL}.json")
 
 scan_results = {
     "meta": {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "model": "GAT-GRU-Vec",
+        "model": MODEL,
         "restrict_industry": RESTRICT_INDUSTRY,
         "scan_step": SCAN_STEP,
         "dense_zones": [{"start": zs, "end": ze, "step": ds} for zs, ze, ds in HIGH_DENSE_ZONES],

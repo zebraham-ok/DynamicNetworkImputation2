@@ -137,6 +137,8 @@ THR_CSV_CANDIDATES = (
 # Every model this project can plot. Doubles as the fallback whitelist when there is no plot config.
 BUILTIN_MODEL_DISPLAY = {
     'bigru': 'BiGRU',
+    # 0916-1159: BiGRU with trainer.kwargs.label_smoothing = 0.1
+    'bigru-smooth': 'BiGRU-LS',
     'egcn': 'EvolveGCN-H',
     # 0913-2134: identical to 'egcn' except trainer.kwargs.label_smoothing = 0.1
     'egcn-smooth': 'EvolveGCN-H-LS',
@@ -146,6 +148,8 @@ BUILTIN_MODEL_DISPLAY = {
     # 0913-1951: the two-layer GAT-GRU with trainer.kwargs.label_smoothing = 0.1
     'gatgru2layer-smooth': 'GAT-GRU-LS',
     'tna': 'BiTNA',
+    # 0916-1155: BiTNA with trainer.kwargs.label_smoothing = 0.1
+    'tna-smooth': 'BiTNA-LS',
     'seal': 'SEAL',
     # Attribute-fusion variants of run_sampling.py (FiLMGATGRU): the 0912-1936 repeat overrides
     # num_rnn_layers=2, hence the '*' suffix used for the two-layer backbone everywhere else.
@@ -163,12 +167,14 @@ MODEL_CONFIG = os.environ.get(plot_models.ENV_VAR, '')
 
 MODEL_BASE_COLORS = {
     'bigru': 'Blues',
+    'bigru-smooth': 'Blues',      # 四次双模式-up: 该目录下全是 LS 模型，沿用基座的色系
     'egcn': 'Greens',
     'egcn-smooth': 'cool',
     'gatgru': 'Oranges',
     'gatgru2layer': 'YlOrBr',
     'gatgru2layer-smooth': 'spring',
     'tna': 'Purples',
+    'tna-smooth': 'Purples',      # 同上，沿用 BiTNA 的色系
     'seal': 'RdPu',
     'fusion1layer': 'Reds',
     'fusion2layer': 'cividis',
