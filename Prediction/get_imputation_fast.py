@@ -273,6 +273,7 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
     DataModule = importlib.import_module(ds_cfg['module'])
     CompanySupplyDataset = getattr(DataModule, 'CompanySupplyDataset')
     build_static_graph = getattr(DataModule, 'build_static_graph')
+    ensure_degree_ready_for_deployment = getattr(DataModule, 'ensure_degree_ready_for_deployment')
 
     year_range = impu_data_cfg.get('year_range', list(range(2013, 2026)))
     cls_params = set(inspect.signature(CompanySupplyDataset.__init__).parameters.keys())
@@ -293,6 +294,13 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         # Degree channel: must match the layout the checkpoint was trained on (d -> d + 1)
         'use_attr_degree': ds_cfg.get('use_attr_degree', False),
         'degree_property': ds_cfg.get('degree_property', 'degree'),
+        # 2026-09-17: the count is derived at run time; a deployment run may use the whole observed
+        # graph ('full' / 'calibrated_full') but never the training split ('train_only').
+        'degree_scope': ds_cfg.get('degree_scope', 'full'),
+        'degree_triples_path': ds_cfg.get('degree_triples_path', None),
+        'degree_thinning': ds_cfg.get('degree_thinning', 1.0),
+        'degree_thinning_seed': ds_cfg.get('degree_thinning_seed', None),
+        'degree_calibration_path': ds_cfg.get('degree_calibration_path', None),
     }
     for k, v in extra_candidates.items():
         if k in cls_params:
@@ -300,6 +308,9 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
     full_dataset_kwargs = {k: v for k, v in full_dataset_kwargs.items() if k in cls_params}
 
     full_dataset = CompanySupplyDataset(**full_dataset_kwargs)
+    # The degree column is a run-time derived feature (never a Neo4j property since 2026-09-17), so
+    # build it here and refuse the scopes that cannot exist at deployment time.
+    ensure_degree_ready_for_deployment(full_dataset)
 
     print("\n[2/4] Building full graph data...")
     dynamic_data = build_static_graph(

@@ -354,6 +354,7 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
     DataModule = importlib.import_module(ds_cfg['module'])
     CompanySupplyDataset = getattr(DataModule, 'CompanySupplyDataset')
     build_static_graph = getattr(DataModule, 'build_static_graph')
+    ensure_degree_ready_for_deployment = getattr(DataModule, 'ensure_degree_ready_for_deployment')
 
     year_range = impu_data_cfg.get('year_range', list(range(2013, 2026)))
     cls_params = set(inspect.signature(CompanySupplyDataset.__init__).parameters.keys())
@@ -374,6 +375,13 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
         # Degree channel: must match the layout the checkpoint was trained on (d -> d + 1)
         'use_attr_degree': ds_cfg.get('use_attr_degree', False),
         'degree_property': ds_cfg.get('degree_property', 'degree'),
+        # 2026-09-17: the count is derived at run time; a deployment run may use the whole observed
+        # graph ('full' / 'calibrated_full') but never the training split ('train_only').
+        'degree_scope': ds_cfg.get('degree_scope', 'full'),
+        'degree_triples_path': ds_cfg.get('degree_triples_path', None),
+        'degree_thinning': ds_cfg.get('degree_thinning', 1.0),
+        'degree_thinning_seed': ds_cfg.get('degree_thinning_seed', None),
+        'degree_calibration_path': ds_cfg.get('degree_calibration_path', None),
     }
     for k, v in extra_candidates.items():
         if k in cls_params:
@@ -381,6 +389,9 @@ def load_model(cfg: dict, device: torch.device) -> Tuple[nn.Module, dict, Any, A
     full_dataset_kwargs = {k: v for k, v in full_dataset_kwargs.items() if k in cls_params}
 
     full_dataset = CompanySupplyDataset(**full_dataset_kwargs)
+    # The degree column is a run-time derived feature (never a Neo4j property since 2026-09-17), so
+    # build it here and refuse the scopes that cannot exist at deployment time.
+    ensure_degree_ready_for_deployment(full_dataset)
 
     print("\n[2/4] Building full graph data...")
     dynamic_data = build_static_graph(
@@ -605,6 +616,18 @@ class Neo4jBatchWriter:
     # It used to be, so re-running with a score that differs at the 4th decimal created a PARALLEL
     # edge instead of updating the existing one. The identity of an imputed edge is
     # (src, tgt, year, source, model); the score is then written with SET.
+    #
+    # DIAGNOSTIC RETURN (2026-09-18): the old version returned `count(r)` and the caller threw it
+    # away, adding `len(batch)` to the "written" counter instead. `written` therefore counted ROWS
+    # SENT, not edges persisted, which hides two failure modes:
+    #   matched < sent : `MATCH (u),(v) WHERE id(u)=row.src AND id(v)=row.tgt` found no node, so
+    #                    that row is dropped silently (MERGE never runs, no error is raised);
+    #   created < matched : MERGE matched an edge that already has the same
+    #                    (src, tgt, year, source, model), so nothing new was written.
+    # The two are separated here with a transient `__impute_new` marker that is REMOVEd again in
+    # the same statement, so no extra property is left behind. Revert to the plain 2-line version
+    # (`SET r.probability = row.prob` / `RETURN count(r) AS written`) once the accounting question
+    # is settled - the marker costs one extra property write + removal per row.
     _BATCH_WRITE_QUERY_TEMPLATE = """
         UNWIND $batch AS row
         MATCH (u:%(label)s), (v:%(label)s)
@@ -614,8 +637,26 @@ class Neo4jBatchWriter:
             source: '%(source)s',
             model: '%(model_name)s'
         }]->(v)
+        ON CREATE SET r.probability = row.prob, r.__impute_new = true
+        ON MATCH SET r.probability = row.prob
+        WITH r, r.__impute_new IS NOT NULL AS is_new
+        REMOVE r.__impute_new
+        RETURN count(r) AS matched, sum(CASE WHEN is_new THEN 1 ELSE 0 END) AS created
+    """
+
+    # Fallback used only if the diagnostic statement above is rejected (e.g. an older Cypher
+    # version). It keeps the run usable but cannot tell "created" apart from "merged".
+    _LEGACY_WRITE_QUERY_TEMPLATE = """
+        UNWIND $batch AS row
+        MATCH (u:%(label)s), (v:%(label)s)
+        WHERE id(u) = row.src AND id(v) = row.tgt
+        MERGE (u)-[r:%(relation)s {
+            year: row.year,
+            source: '%(source)s',
+            model: '%(model_name)s'
+        }]->(v)
         SET r.probability = row.prob
-        RETURN count(r) as written
+        RETURN count(r) AS matched, count(r) AS created
     """
 
     def __init__(
@@ -654,18 +695,90 @@ class Neo4jBatchWriter:
         self._total_written = 0
         self._lock = threading.Lock()
         self._flush_count = 0
+        # DIAGNOSTIC accounting (2026-09-18): rows sent vs rows whose MATCH hit vs rows MERGE
+        # actually created. See the comment on _BATCH_WRITE_QUERY_TEMPLATE.
+        self._rows_matched = 0
+        self._rows_created = 0
+        self._dropped_examples: List[Dict] = []
+        self._dedup_examples: List[Dict] = []
+        self._last_report_ts = 0.0
+        self._db_before = None
 
-        self._query = self._BATCH_WRITE_QUERY_TEMPLATE % {
+        _fmt = {
             'label': self.label_name,
             'relation': self.relation_name,
             'source': self.output_source,
             'model_name': self.output_model,
         }
+        self._query = self._BATCH_WRITE_QUERY_TEMPLATE % _fmt
+        self._legacy_query = self._LEGACY_WRITE_QUERY_TEMPLATE % _fmt
+        self._use_legacy = False
 
     @property
     def total_written(self) -> int:
         with self._lock:
             return self._total_written
+
+    def count_edges(self):
+        """Count the imputation edges for this model that exist right now.
+
+        DIAGNOSTIC (2026-09-18): the only number a faulty counter cannot fake. Taking it before
+        and after the run says how much really reached the database.
+        """
+        try:
+            from Data.neo4j_SPLC import Neo4jClient
+            rows = Neo4jClient().execute_query(
+                f"MATCH ()-[r:{self.relation_name}]->() "
+                f"WHERE r.source = $src AND r.model = $model "
+                f"RETURN count(r) AS n",
+                parameters={'src': self.output_source, 'model': self.output_model})
+            return int(rows[0]['n']) if rows else None
+        except Exception as e:
+            print(f"[Writer-account] could not count existing edges: {e}")
+            return None
+
+    def preflight(self, rows: List[Dict]) -> bool:
+        """Write a handful of rows synchronously and report what the database actually did.
+
+        DIAGNOSTIC (2026-09-18): answers "does anything land at all?" in seconds instead of after
+        a multi-hour run. Two independent facts are checked:
+          1. do the node ids come from THIS database (`MATCH ... WHERE id(n) IN $ids`)?
+          2. does the real write statement turn a row into a NEW relationship?
+        Returns True only if every row was both matched and created.
+        """
+        from Data.neo4j_SPLC import Neo4jClient
+        client = Neo4jClient()
+        ids = sorted({int(r['src']) for r in rows} | {int(r['tgt']) for r in rows})
+        n_hit = None
+        try:
+            res = client.execute_query(
+                f"MATCH (n:{self.label_name}) WHERE id(n) IN $ids RETURN count(n) AS n",
+                parameters={'ids': ids})
+            n_hit = int(res[0]['n']) if res else 0
+        except Exception as e:
+            print(f"[Preflight] id-resolution query failed: {e}")
+        if n_hit is not None:
+            print(f"[Preflight] {n_hit}/{len(ids)} node ids resolve against "
+                  f"(:{self.label_name}) in the connected database")
+            if n_hit != len(ids):
+                print("[Preflight] FAIL: some ids do not exist in this database. Rows whose "
+                      "MATCH misses are dropped silently by Cypher and never raise an error - "
+                      "that alone can explain 'written' >> 'in the database'.")
+
+        before = self.count_edges()
+        try:
+            self._execute_and_account(client, rows)
+        except Exception as e:
+            print(f"[Preflight] the write statement failed outright: {e}")
+            return False
+        after = self.count_edges()
+        print(f"[Preflight] {len(rows)} row(s) sent -> matched={self._rows_matched} "
+              f"created={self._rows_created}; DB count {before} -> {after}")
+        ok = (self._rows_created == len(rows))
+        print("[Preflight] OK: writes land in the database." if ok else
+              "[Preflight] FAIL: sent rows did not become new edges "
+              "(matched < sent -> id lookup miss; created < matched -> MERGE hit an existing edge).")
+        return ok
 
     def start(self):
         """Start the background writer threads"""
@@ -704,6 +817,10 @@ class Neo4jBatchWriter:
             t.start()
             self._workers.append(t)
 
+        self._db_before = self.count_edges()
+        print(f"[Writer-account] imputation edges already in the DB "
+              f"(source='{self.output_source}', model='{self.output_model}'): {self._db_before}")
+
     def _flush_buffer(self, client, batch: List[Dict], max_retries: int = 3):
         """Batch-write the buffer to Neo4j (single UNWIND statement), with deadlock retries"""
         if not batch:
@@ -712,11 +829,7 @@ class Neo4jBatchWriter:
         last_error = None
         for attempt in range(max_retries):
             try:
-                params = {"batch": batch}
-                client.execute_query(self._query, parameters=params)
-                with self._lock:
-                    self._total_written += len(batch)
-                    self._flush_count += 1
+                self._execute_and_account(client, batch)
                 return  # success, return directly
             except Exception as e:
                 last_error = e
@@ -746,21 +859,68 @@ class Neo4jBatchWriter:
                 else:
                     print(f"  [Writer] Single-row write failed: {e2}")
 
-    def _write_single(self, client, item: Dict):
-        """Fallback: single-row write"""
-        query = f"""
-            MATCH (u:{self.label_name}), (v:{self.label_name})
-            WHERE id(u) = {item['src']} AND id(v) = {item['tgt']}
-            MERGE (u)-[r:{self.relation_name} {{
-                year: {item['year']},
-                source: '{self.output_source}',
-                model: '{self.output_model}'
-            }}]->(v)
-            SET r.probability = {item['prob']:.4f}
+    def _execute_and_account(self, client, batch: List[Dict]):
+        """Run the batch write and account for sent / matched / created rows.
+
+        DIAGNOSTIC (2026-09-18). Three different numbers are tracked because the progress bar's
+        `written` counter only ever reported the first of them:
+
+          sent    : rows handed to Neo4j (what `written` used to report);
+          matched : rows whose `MATCH (u),(v) WHERE id(u)=row.src ...` found both endpoints;
+                    sent - matched = rows dropped silently because the id lookup missed;
+          created : rows for which MERGE actually created a new relationship;
+                    matched - created = rows that hit an identical (src,tgt,year,source,model)
+                    edge and were therefore only updated, never added.
+
+        A short report is printed at most once every 30 s so a full 162M-pair run stays readable.
         """
-        client.execute_query(query)
+        try:
+            result = client.execute_query(self._query, parameters={"batch": batch})
+        except Exception as e:
+            if not self._use_legacy:
+                self._use_legacy = True
+                print(f"\n[Writer-account] the diagnostic write statement was rejected ({e}); "
+                      f"falling back to the legacy statement. 'merged (already existed)' can "
+                      f"then no longer be separated from 'created'.")
+            result = client.execute_query(self._legacy_query, parameters={"batch": batch})
+        matched = created = 0
+        if result:
+            rec = result[0]
+            matched = int(rec.get('matched') or 0)
+            created = int(rec.get('created') or 0)
+
+        sent = len(batch)
         with self._lock:
-            self._total_written += 1
+            self._total_written += sent
+            self._rows_matched += matched
+            self._rows_created += created
+            self._flush_count += 1
+            dropped = self._total_written - self._rows_matched
+            deduped = self._rows_matched - self._rows_created
+            snap = (self._total_written, self._rows_matched, self._rows_created,
+                    self._flush_count)
+            now = time.time()
+            report = (now - self._last_report_ts) > 30.0
+            if report:
+                self._last_report_ts = now
+            if len(self._dropped_examples) < 5 and matched < sent:
+                self._dropped_examples.append({'batch_rows': sent, 'matched': matched})
+            if len(self._dedup_examples) < 5 and created < matched:
+                self._dedup_examples.append({'batch_rows': sent, 'matched': matched,
+                                             'created': created})
+
+        if matched < sent or created < matched:
+            if len(self._dropped_examples) <= 1 and len(self._dedup_examples) <= 1:
+                print(f"\n[Writer] first bad batch: sent={sent} matched={matched} "
+                      f"created={created} (kept for inspection)")
+        if report:
+            print(f"\n[Writer-account] sent={snap[0]:,} matched={snap[1]:,} "
+                  f"created={snap[2]:,} | dropped(no such id)={dropped:,} "
+                  f"merged(already existed)={deduped:,} | batches={snap[3]:,}")
+
+    def _write_single(self, client, item: Dict):
+        """Fallback: single-row write (same statement, one-element UNWIND batch)"""
+        self._execute_and_account(client, [item])
 
     def enqueue(self, src_neo4j: int, tgt_neo4j: int, year: int, prob: float):
         """Push a threshold-passing edge into the write queue (non-blocking)"""
@@ -791,6 +951,28 @@ class Neo4jBatchWriter:
             t.join(timeout=600)
         print(f"[Writer] Background writing complete: {self.total_written:,} rows total, "
               f"{self._flush_count} batch writes")
+        # DIAGNOSTIC (2026-09-18): the number that matters is `created`, not `sent`.
+        matched, created = self._rows_matched, self._rows_created
+        print(f"[Writer-account] sent={self._total_written:,} "
+              f"matched={matched:,} created={created:,}")
+        print(f"[Writer-account] dropped (MATCH found no node, row silently lost)="
+              f"{self._total_written - matched:,}")
+        print(f"[Writer-account] merged (MERGE hit an identical edge, nothing added)="
+              f"{matched - created:,}")
+        if self._dropped_examples:
+            print(f"[Writer-account] first dropped batches: {self._dropped_examples[:5]}")
+        if self._dedup_examples:
+            print(f"[Writer-account] first merged batches: {self._dedup_examples[:5]}")
+        if created == 0 and self._total_written > 0:
+            print("[Writer-account] NOTHING was persisted: check that the ids handed to the "
+                  "writer are Neo4j internal ids of the database the script is connected to.")
+        after = self.count_edges()
+        delta = None if (after is None or self._db_before is None) else after - self._db_before
+        print(f"[Writer-account] DB count {self._db_before} -> {after} (delta={delta}); "
+              f"the writer counted {created:,} creations")
+        if delta is not None and created > 0 and delta < created:
+            print(f"[Writer-account] MISMATCH: the database gained {delta:,} edges while the "
+                  f"writer counted {created:,} - trust the DB delta, not the writer counter.")
 
 
 class NullWriter:
@@ -853,6 +1035,9 @@ class ImputationPredictorFast:
         self.test_industry = impu_cfg.get('test_industry', 'example_industry')
         self.skip_existing = impu_cfg.get('skip_existing', True)
         self.dry_run = bool(impu_cfg.get('dry_run', False))
+        # DIAGNOSTIC (2026-09-18): prove that writes reach the database before spending hours
+        # scoring 162M candidate pairs (see Neo4jBatchWriter.preflight / --no-preflight).
+        self._preflight = bool(impu_cfg.get('writer_preflight', True)) and not self.dry_run
         self.year_range = data_cfg.get('year_range', list(range(2013, 2026)))
         # min_degree was applied when the graph was built (see load_model); it is re-read here only
         # so the predictor can report it and, when asked, drop low-degree nodes from the candidates.
@@ -1217,6 +1402,7 @@ class ImputationPredictorFast:
         saved_count = 0
         start_time = time.time()
         last_postfix = 0.0
+        preflight_done = False
 
         pbar = tqdm(total=total_estimate, desc="prediction progress", unit="pairs",
                      dynamic_ncols=True)
@@ -1252,6 +1438,23 @@ class ImputationPredictorFast:
                 if not upstream_ids or not downstream_ids:
                     pbar.update(block_total)
                     continue
+
+                # DIAGNOSTIC (2026-09-18): one synchronous write probe on the first usable block,
+                # so a broken write path is caught in seconds instead of after hours of scoring.
+                if self._preflight and not preflight_done:
+                    preflight_done = True
+                    probe = [{'src': int(up_neo4j[0]), 'tgt': int(down_neo4j[0]),
+                              'year': int(self.year_range[0]), 'prob': 0.0}]
+                    if num_up > 1 and num_down > 1:
+                        probe.append({'src': int(up_neo4j[-1]), 'tgt': int(down_neo4j[-1]),
+                                      'year': int(self.year_range[-1]), 'prob': 0.0})
+                    if not writer.preflight(probe):
+                        print("\n[Preflight] Aborting before scoring: nothing would reach the "
+                              "database. Fix the connection / id space first, or pass "
+                              "--no-preflight to skip this check.")
+                        pbar.close()
+                        writer.stop()
+                        return
 
                 existing_set = set()
                 if self.skip_existing:
@@ -1327,8 +1530,15 @@ class ImputationPredictorFast:
                         hit_pos = np.flatnonzero(probs_np > self.threshold)
 
                         if hit_pos.size:
+                            # BUG FIX (2026-09-18, data-correctness): `hit_pos` indexes INSIDE the
+                            # slice (0 .. len(sl)), while i/j/k span the whole chunk. Without the
+                            # slice offset `s`, every slice re-read the FIRST `batch_size` rows of
+                            # the chunk, so the run emitted the same ~batch_size (src,tgt,year)
+                            # triples over and over: MERGE matched them, nothing new was created
+                            # (observed: sent=792,502 / matched=792,502 / created=513), and the
+                            # probabilities written belonged to different pairs than the endpoints.
                             hit_t = torch.as_tensor(hit_pos, dtype=torch.long,
-                                                    device=self.device)
+                                                    device=self.device) + s
                             src_nb = up_nb_t[i[hit_t]].cpu().numpy()
                             tgt_nb = down_nb_t[j[hit_t]].cpu().numpy()
                             hit_year = years_t[k[hit_t]].cpu().numpy()
@@ -1369,9 +1579,19 @@ class ImputationPredictorFast:
         print(f"Total pairs predicted: {total_processed:,}")
         print(f"Skipped existing edges: {skipped_count:,}")
         print(f"Edges above threshold: {saved_count:,}")
-        print(f"Actually written to Neo4j: {writer.total_written:,} ({writer._flush_count} batch writes)")
+        print(f"Rows sent to Neo4j: {writer.total_written:,} ({writer._flush_count} batch writes)")
+        print(f"Rows matched by MATCH (both endpoints found): "
+              f"{getattr(writer, '_rows_matched', writer.total_written):,}")
+        print(f"Edges actually created in Neo4j: "
+              f"{getattr(writer, '_rows_created', writer.total_written):,}")
         if total_processed > 0:
-            print(f"Hit rate: {saved_count/total_processed*100:.2f}%")
+            hit = saved_count / total_processed
+            print(f"Hit rate: {hit*100:.2f}%")
+            if hit > 0.5:
+                print(f"[WARN] hit rate {hit*100:.1f}% is implausibly high: the threshold "
+                      f"({self.threshold}) is barely filtering, so the run is trying to write a "
+                      f"large fraction of all {total_processed:,} candidate pairs. Check "
+                      f"prediction.threshold / prediction.threshold_by_model in the config.")
         print(f"Total elapsed: {timedelta(seconds=int(total_elapsed))}")
         print(f"Average speed: {total_processed/total_elapsed:.1f} pairs/s")
         print("=" * 60)
@@ -1424,6 +1644,9 @@ def main():
                         help='number of Neo4j query threads (default 8)')
     parser.add_argument('--dry-run', action='store_true',
                         help='score everything but write nothing to Neo4j (tuning aid)')
+    parser.add_argument('--no-preflight', action='store_true',
+                        help='skip the start-up write probe that checks the node ids resolve and '
+                             'that a written row really becomes a new relationship')
     parser.add_argument('--pair-chunk-size', type=int, default=None,
                         help='how many candidate pairs are materialised on the device at once '
                              '(performance.pair_chunk_size, default 1000000; each chunk is then '
@@ -1462,6 +1685,8 @@ def main():
         cfg.setdefault('prediction', {})['skip_existing'] = False
     if args.dry_run:
         cfg.setdefault('prediction', {})['dry_run'] = True
+    if args.no_preflight:
+        cfg.setdefault('prediction', {})['writer_preflight'] = False
     if args.min_degree is not None:
         cfg.setdefault('data', {})['min_degree'] = args.min_degree
     if args.exclude_low_degree_nodes is not None:

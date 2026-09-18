@@ -43,18 +43,24 @@ data:
     - country
     - industry_2nd
     - category_3rd
-  # Degree channel: true -> append one column log(1 + degree) to X (d -> d + 1). The degree is the
-  # whole-window incident-triple count written to the Neo4j property `degree_property` on demand.
-  # This config does NOT inherit Training/common_config.yaml, so keep the value in sync by hand.
-  # WARNING: transductive statistic - it is computed from the same quantity `min_degree` filters on
-  # and it also sees the val/test edges, so the column alone separates the positives (measured
-  # degree-only AUC 0.984; see Training/common_config.yaml for the full note). Never compare such a
-  # run with a no-degree run, and never use it for a paper result.
-  # Kept in step with the 2026-09-16 (second revision) default of Training/common_config.yaml
-  # (use_attr_degree: false), so bootstrap rounds and the main backbones read the same X layout
-  # (d = 701). Switch both or neither.
+  # Degree channel: true -> append one column log(1 + degree) to X (d -> d + 1).
+  # NOTE: this file does NOT inherit Training/common_config.yaml, so keep these values in sync by
+  # hand with Training/common_config.yaml (dataset.use_attr_degree / degree_scope / thinning / ...).
+  # 2026-09-17 CHANGE: the count is derived at run time, never written to Neo4j, and the default
+  # scope is `train_only` - only the 80% train pool is counted, and the three-way split shares that
+  # one column. `full` (every positive of the window) reproduces the pre-2026-09-17 behaviour and
+  # must not be used to score val/test: the column is the very quantity `min_degree` filters on, so
+  # a whole-window count encodes the inclusion rule itself (measured degree-only AUC 0.984; see the
+  # long comment in Training/common_config.yaml).
+  # The *_deg runs therefore have to be RERUN: their numbers came from the leaked whole-window count.
   use_attr_degree: false
-  degree_property: degree
+  degree_property: degree        # DEPRECATED: no longer read or written
+  degree_scope: train_only       # train_only | full | calibrated_full
+  degree_triples_path: null      # set automatically from the three-way split
+  degree_thinning: 1.0
+  degree_thinning_seed: null
+  degree_calibration_path: null
+  degree_calibration_out: null
 
 # === Bootstrap iterations ===
 bootstrap:

@@ -31,6 +31,22 @@ data:
   # positives, otherwise a node could fall below the threshold just because its edges were removed.
   exclude_low_degree_nodes: false
 
+# --- Node features (deep-merged on top of Training/common_config.yaml; same-named keys win) ---
+# DEPLOYMENT uses a DIFFERENT degree scope than training, and the override has to be explicit here
+# because common_config.yaml defaults to `train_only`. At deployment there is no held-out split:
+# the candidate pair is unobserved by definition (so its own edge cannot boost its own feature) and
+# the adjacency the messages already travel along is the whole observed graph, so the count must be
+# the whole observed graph too. See the long comment in Training/common_config.yaml 3.x and
+# TechnicalGuide.md 3.5.
+dataset:
+  use_attr_degree: false           # keep in step with the trained checkpoint (affects X width!)
+  degree_scope: full               # full | calibrated_full. `train_only` is REFUSED here.
+  degree_calibration_path: null    # reference npz produced by the training run; needed by
+                                   # `calibrated_full` (recommended when the ckpt was trained with
+                                   # degree_scope: train_only, otherwise the column is off-scale)
+  degree_thinning: 1.0             # deployment counts everything it observes: no thinning
+  degree_triples_path: null        # unused at deployment (the count runs on the observed graph)
+
 # --- Prediction ---
 prediction:
   threshold: 0.452                     # prediction probability threshold, above this value is saved to Neo4j
@@ -74,6 +90,18 @@ prediction:
     #   Youden = 0.8676 (F1-max 0.8680); fusion2layer (= fusion_film with 2 RNN layers) peaks at
     #   seed44 scratch, AUC 0.8955 -> Youden 0.7967: results/四次双模式/ensemble/fusion2layer/sampling_0912-1936/seed44/0_ftf_scratch/best_auc_model.pth
     # fusion_temporal_injection: 0.000 # GAT-GRU-TI — no run under 四次双模式
+    # --- 度通道消融（探针口径，不进论文主结果；只在明确要拿"带度"模型做插补对比时启用）---
+    egcn_deg: 0.1269                   # EGCN-Deg, ftf, seed43 frozen, AUC 0.9724（4 个 ftf run 最高）
+    #   pth: results/egcn_deg/sampling_0917-2107/seed43/0_ftf_frozen/best_auc_model.pth
+    #        （zip: results/四次双模式-deg/egcn-deg.zip :: sampling_0917-2107/seed43/0_ftf_frozen/）
+    #   Youden = 0.1269（F1-max 0.1270，两者几乎重合）；epoch 6（0-based 5）
+    #   注意 ① 阈值只对应 best_auc_model.pth（best_model.pth 的 Youden 是 0.1369，别混用）；
+    #        ② 该 ckpt 是 d=702，加载时必须 model.config_name: egcn_deg 且
+    #           dataset.use_attr_degree: true；degree_scope 只能用 full（训练时
+    #           degree_calibration_out 为 null，没有 calibrated_full 的参考文件，会有尺度漂移警告）。
+    #   bigru-deg（results/四次双模式-deg/bigru-deg.zip）的 ckpt 同样是 d=702，但它的
+    #   run.config_name 写成 bigru_vec ⇒ 用本地 bigru_vec.yaml（d=701）加载必然 strict 失败；
+    #   要用请先补 Models/configs/bigru_vec_deg.yaml（照 egcn_deg.yaml 写）再加载。
   batch_size: 512                      # batch size for batched inference
   test_mode: false                     # test mode: true=process only one industry
   test_industry: "example_industry"  # must match a key in indus_network.json; used only in test mode

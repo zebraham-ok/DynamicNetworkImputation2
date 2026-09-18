@@ -34,29 +34,57 @@ dataset:
   # --- Node feature: degree channel log(1 + degree) ---
   # true -> ONE extra column is appended to X, so
   #         X = [embedding | one-hot(...) | log1p(degree)]   (701 -> 702 with the attrs above).
-  # `degree` = number of incident (source, target, year) triples in 2013-2025 counted on BOTH
-  # endpoints, restricted by `source_filter` - i.e. exactly the quantity `min_degree` thresholds
-  # on, so the two are on the same scale. It is read from the Neo4j node property `degree_property`;
-  # if that property is missing (or only partially filled) the dataset computes it once and writes
-  # it back to Neo4j before the first feature assembly, so later runs just read it.
-  # DESIGN CAVEAT: the degree is a whole-window, transductive statistic - it is computed from ALL
-  # positives of the window, INCLUDING the val/test edges - and it is the very same quantity that
-  # `min_degree` (2) thresholds on, so the column encodes the positive-inclusion rule itself.
-  # MEASURED LEAK (2026-09-16, _tmp_dump/leak_degree.py, positives vs the val/test fixed-negative
-  # distribution = uniform random pairs among the embedded companies): using the single column
-  # min(log1p(deg_u), log1p(deg_v)) AS the score already gives AUC 0.984 (0.936 after subtracting
-  # the sample's own edge; the bare [min(du,dv) >= 2] indicator alone gives 0.944), while the
-  # degree-channel model itself only reaches test AUC 0.975 (Intra-Indus) / 0.9885 (All-Rand).
-  # The whole "gain" is therefore explained by that one column, not by anything the model learned.
-  # DEFAULT (2026-09-16, second revision): false - OPT-IN ONLY. The only place it may be switched on
-  # is the ablation grid Models/configs/{gatgru_vec,gatgru_2layer}_deg*.yaml, where it is a
-  # separability probe ("can the label be told from degree alone"), NEVER a "better model" claim,
-  # and its val/test metrics must not be put next to a no-degree run or into the paper's result
-  # table. Everything that is not that ablation keeps the historical d = 701 layout.
+  # `degree` = number of incident (source, target, year) triples counted on BOTH endpoints,
+  # restricted by `source_filter` - i.e. exactly the quantity `min_degree` thresholds on, so the two
+  # are on the same scale. Since 2026-09-17 the column is a RUN-TIME DERIVED FEATURE: it is computed
+  # per run and NEVER read from / written to Neo4j (the old behaviour wrote it back as the integer
+  # node property `degree_property`, which made it unreproducible, unversioned global state).
+  #
+  # degree_scope decides WHICH EDGES the count may see (TechnicalGuide.md 3.5):
+  #   train_only       DEFAULT. Counted from the 80% train pool only; train/val/test share that one
+  #                    column, exactly like the static graph's edge set (which is train_pool-only
+  #                    too). The ONLY setting whose val/test numbers may be quoted.
+  #   full             Every positive of the window. Historically this was the only behaviour, and it
+  #                    is still right at DEPLOYMENT time (see below) - but using it to score val/test
+  #                    puts the held-out edges back into the feature.
+  #   calibrated_full  Count every positive, then quantile-map onto the training-time reference read
+  #                    from `degree_calibration_path` (npy/npz written by `degree_calibration_out`
+  #                    during training). Use it when deploying a train_only-trained checkpoint.
+  #
+  # WHY `full` IS CORRECT AT DEPLOYMENT: the deployed graph is fully observed - the candidate pair is
+  # unobserved BY CONSTRUCTION, so its own edge cannot boost its own feature (no self-leak), and the
+  # static graph the messages already travel along at inference time is the whole observed graph
+  # too. A train-pool column would therefore be *inconsistent* with the adjacency you feed next to
+  # it. The price is the train/deploy scale drift (a train column is a ~0.8 thinning of the observed
+  # window, relative sd ~ 0.5/sqrt(degree)): either train with `degree_thinning` < 1 so the model
+  # sees several completeness levels, or deploy with `calibrated_full`.
+  # Prediction/imputation_common.yaml must state its own scope (it does: `full`), and every other
+  # entry point must NOT silently inherit `train_only`.
+  #
+  # DESIGN CAVEAT (unchanged): the column is the quantity `min_degree` (2) thresholds on, so a whole
+  # -window count encodes the positive-inclusion rule itself. MEASURED LEAK (2026-09-16,
+  # _tmp_dump/leak_degree.py): a single min(log1p(deg_u), log1p(deg_v)) column already scores
+  # AUC 0.984 (0.936 after subtracting the sample's own edge; the bare [min(du,dv) >= 2] indicator
+  # alone gives 0.944). Under `degree_scope: train_only` the column no longer equals that gate, which
+  # is precisely the point - the *_deg runs must be RERUN and their conclusions restated, because
+  # the old numbers came from the leaked (full-window) count.
+  # DEFAULT: false - OPT-IN ONLY. It may only be switched on inside the ablation grid
+  # Models/configs/{gatgru_vec,gatgru_2layer,egcn}_deg*.yaml (2026-09-17: egcn_deg added, same probe,
+  # different backbone), where it is a separability probe ("can the label be told from degree
+  # alone"), NEVER a "better model" claim, and its val/test metrics must not be put next to a
+  # no-degree run or into the paper's result table. Everything that is not that
+  # ablation keeps the historical d = 701 layout.
   # The width is part of the embedding-cache fingerprint: d = 701 checkpoints cannot be loaded into
   # a d = 702 model, so toggling this key invalidates the ckpt / backbone.pth and needs a retrain.
   use_attr_degree: false
-  degree_property: degree        # Neo4j property that stores the degree (created on demand)
+  degree_property: degree        # DEPRECATED: no longer read or written (kept so old configs parse)
+  degree_scope: train_only       # train_only | full | calibrated_full  (see the block above)
+  degree_triples_path: null      # CSV of (source,target,year) ids; only needed outside the study
+                                 # pipeline, where the train pool is taken from the split instead
+  degree_thinning: 1.0           # keep-probability of the counted triples ((0,1]); 1.0 = as-is
+  degree_thinning_seed: null     # null -> derive from the dataset sample seed (reproducible)
+  degree_calibration_path: null  # reference column read by `calibrated_full`
+  degree_calibration_out: null   # optional: dump the train_only column here for later deployment
 
 # --- Model architecture: the parts shared by every backbone ---
 # Inherited by every Models/configs/{model}.yaml through the deep merge, so the shared node-feature

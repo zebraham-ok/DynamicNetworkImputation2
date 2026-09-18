@@ -59,6 +59,7 @@ from Data.company_dataset import (
     _sample_fixed_negatives,
     _load_csv_negatives,
     _split_8_1_1,
+    rebuild_degree_column,
 )
 
 
@@ -110,6 +111,10 @@ def load_bootstrap_test_set(bootstrap_dir: str) -> dict:
     all_pos_raw = full_dataset.original_positive_samples
     all_pos = list(set(all_pos_raw))
     all_pos.sort(key=lambda s: (s[2], s[0], s[1]))
+
+    # Degree channel (2026-09-17): rebuild the very same train-pool column the evaluated run used.
+    # Nothing is read from Neo4j - the count is deterministic given (all_pos, ratios, seed_base).
+    rebuild_degree_column(full_dataset, all_pos, data_cfg, seed_base)
 
     neg_pool = _build_negative_pool(full_dataset, all_pos, rng)
     test_neg = _sample_fixed_negatives(

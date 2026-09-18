@@ -336,17 +336,27 @@ composition of its neighbourhood.
 ```yaml
 dataset:
   use_attr_degree: false        # true -> append log1p(degree) as the last column of X
-  degree_property: degree       # Neo4j property that stores the degree
+  degree_scope: train_only      # train_only | full | calibrated_full
+  degree_property: degree       # DEPRECATED: no longer read/written
 ```
 
-`degree` counts the incident `(source, target, year)` triples of the 2013-2025 window on both
-endpoints (the same quantity `min_degree` thresholds on, restricted by `source_filter`). It is
-persisted on the Neo4j node as `degree_property`: when that property is missing the dataset
-computes it once and writes it back before the first feature assembly, so later runs simply read
-it. Two caveats: (i) it is a **whole-window, transductive** statistic, so a run with the channel
-enabled must not be compared with the baseline on val/test metrics — use it to test *whether*
-degree information helps, not to claim a better model; (ii) turning it on changes the width of
-`X`, so every checkpoint has to be retrained.
+`degree` counts the incident `(source, target, year)` triples on both endpoints (the same
+quantity `min_degree` thresholds on, restricted by `source_filter`). It is a **run-time derived
+feature**: the column is recomputed on every run and is never stored in Neo4j. `degree_scope`
+declares which edges the count may see:
+
+| scope | counted from | when to use |
+|---|---|---|
+| `train_only` | the 80% train pool (default) | every evaluation run - train/val/test share that one column |
+| `full` | every positive of the window | **deployment** (imputation) only - nothing is held out there |
+| `calibrated_full` | `full`, quantile-mapped onto the training-time reference | deploying a `train_only`-trained checkpoint |
+
+Two caveats: (i) the quantity is the one `min_degree` thresholds on, so a **whole-window** count
+encodes the positive-inclusion rule itself and must never be used to score val/test - use the
+channel to test *whether* degree information helps, not to claim a better model, and never put
+such a run next to the no-degree baseline; (ii) turning it on changes the width of `X`, so every
+checkpoint has to be retrained. See `TechnicalGuide.md` §3.5 for the full rationale, the
+train → deploy drift (≈ Binomial(d, 0.8), relative sd ≈ 0.5/√d) and how to calibrate around it.
 
 All five backbones then feed `X` through **one shared extractor**
 (`Models/common.py → NodeFeatureExtractor`, built only via `build_feature_extractor`) whose

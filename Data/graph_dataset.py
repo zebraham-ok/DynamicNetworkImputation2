@@ -44,6 +44,182 @@ def validate_property_name(name: str) -> str:
     return name
 
 
+# --- Degree channel: scopes and pure helpers (2026-09-17) ---------------------
+# The degree column used to be a *whole-window, persisted* Neo4j property: every positive of the
+# 2013-2025 window was counted (including the val/test edges) and the result was written back as an
+# integer node property. Since the very same quantity is what `min_degree` thresholds on, that column
+# encoded the positive-inclusion rule itself (measured degree-only AUC 0.984), and because it was
+# persisted it could not be reproduced, versioned or attributed to a run. It is now computed on the
+# fly, from a declared scope:
+#
+#   train_only       count ONLY the triples handed to the dataset through `set_degree_triples`
+#                    (the study pipeline passes the 80% train pool). Train / val / test share that
+#                    one column, so no split ever sees an edge that is not in the training graph.
+#                    => THE ONLY SETTING THAT MAY BE COMPARED WITH THE NO-DEGREE BASELINE.
+#   full             count every positive of the window (the historical statistic, minus the DB
+#                    write). Legitimate at DEPLOYMENT time (nothing is held out there: the candidate
+#                    pair is unobserved by construction, so its own edge cannot boost its feature),
+#                    and it is the scale the deployment static graph already uses for message
+#                    passing. NEVER use it to score val/test.
+#   calibrated_full  count `full`, then map every value through the empirical distribution of the
+#                    training-time column (quantile mapping), so deployment sees full-graph
+#                    information expressed on the scale the model was trained on. Requires a
+#                    reference file produced by `save_degree_reference` at training time.
+DEGREE_SCOPE_TRAIN_ONLY = 'train_only'
+DEGREE_SCOPE_FULL = 'full'
+DEGREE_SCOPE_CALIBRATED_FULL = 'calibrated_full'
+_DEGREE_SCOPES = (DEGREE_SCOPE_TRAIN_ONLY, DEGREE_SCOPE_FULL, DEGREE_SCOPE_CALIBRATED_FULL)
+
+
+def count_degree_from_triples(triples, node_mapping, dtype=np.float32):
+    """Incident-triple count per node, indexed by PyG node index.
+
+    One count per (source, target, year) row on EACH endpoint - exactly the convention of the old
+    `_degree_edge_query`, so switching scope keeps the definition comparable (this is the same
+    quantity `min_degree` thresholds on; cross-year duplicates are counted more than once).
+    Triples outside `node_mapping` are dropped silently (e.g. a node without an embedding).
+    """
+    values = np.zeros(len(node_mapping), dtype=np.int64)
+    n_skipped = 0
+    for src, tgt, _year in triples:
+        i = node_mapping.get(src)
+        j = node_mapping.get(tgt)
+        if i is None or j is None:
+            n_skipped += 1
+            continue
+        values[i] += 1
+        values[j] += 1
+    if n_skipped:
+        print(f"[Degree] skipped {n_skipped} triples whose endpoint is not in the current node set")
+    return values.astype(dtype)
+
+
+def thin_triples(triples, keep_probability, seed=None):
+    """Keep each triple independently with probability `keep_probability` (run-level thinning).
+
+    Used to train a degree column at an arbitrary observation-completeness level without touching
+    the trainer: a train-pool column is already a ~0.8 thinning of the observed window, so training
+    at several `degree_thinning` values is how the robustness of the column is probed.
+    Deterministic given `seed`; `keep_probability >= 1` returns the triples unchanged.
+    """
+    if keep_probability is None or keep_probability >= 1.0:
+        return list(triples)
+    if keep_probability <= 0.0:
+        return []
+    rng = random.Random(seed)
+    return [t for t in triples if rng.random() < keep_probability]
+
+
+def load_degree_triples_csv(path):
+    """Load (source, target, year) triples from a CSV of Neo4j ids (first/second/last column)."""
+    triples = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.lower().startswith('source'):
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            triples.append((int(parts[0]), int(parts[1]), int(parts[-1])))
+    return triples
+
+
+def save_degree_reference(path, values):
+    """Persist the training-time degree column as an empirical reference (see `map_to_reference`).
+
+    This is an ARTIFACT, not a database property: it belongs next to the checkpoint, it has no
+    effect on the graph, and it can be versioned / deleted / recomputed like any other run output.
+    """
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    np.savez(path, train_degree=values)
+    print(f"[Degree] saved training-time reference distribution -> {path} "
+          f"(n={values.size}, max={int(values.max()) if values.size else 0})")
+
+
+def load_degree_reference(path):
+    """Load a reference degree column written by `save_degree_reference`."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"[Degree] reference file not found: {path}\n"
+            f"  `degree_scope: calibrated_full` needs the training-time degree column. Produce it "
+            f"with save_degree_reference(path, full_dataset.degree_values) in the training run "
+            f"(or set dataset.degree_calibration_out in the training config), then point "
+            f"dataset.degree_calibration_path at it."
+        )
+    with np.load(path) as data:
+        if 'train_degree' not in data:
+            raise ValueError(
+                f"[Degree] {path} has no 'train_degree' array (keys: {sorted(data.files)}) - "
+                f"it was not written by save_degree_reference()"
+            )
+        return data['train_degree'].astype(np.float32).reshape(-1)
+
+
+def map_to_reference(values, reference):
+    """Quantile-map `values` onto the empirical distribution of `reference` (monotone, rank only).
+
+    Removes the systematic scale shift between a full-graph degree column and the thinner
+    training-time column while preserving the ordering, which is all the model can read anyway.
+    """
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    reference = np.sort(np.asarray(reference, dtype=np.float32).reshape(-1))
+    if reference.size == 0:
+        raise ValueError("[Degree] empty reference distribution - cannot calibrate")
+    # Ties are frequent in a degree column (a large zero- and small-degree plateau), so map every
+    # DISTINCT value through its average rank - otherwise tied nodes would end up with different
+    # features purely because of the order they happen to be sorted in.
+    unique_values, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    positions = np.cumsum(counts) - counts                    # first index of every group
+    p_unique = (positions + (counts - 1) / 2.0) / max(values.size - 1, 1)
+    # Probabilities have to be the canonical grid k/(m-1), which is also what np.quantile inverts,
+    # so mapping a distribution onto itself is an exact identity.
+    grid = np.linspace(0.0, 1.0, min(reference.size, 4096))
+    targets = np.quantile(reference, grid)
+    return np.interp(p_unique, grid, targets).astype(np.float32)[inverse]
+
+
+def ensure_degree_ready_for_deployment(dataset, force=False):
+    """Guard for the *deployment* entry points (imputation, threshold fitting on the observed graph).
+
+    At deployment nothing is held out, so the only legal scopes are `full` and `calibrated_full` -
+    a `train_only` column cannot be rebuilt there (there is no split to take the train pool from).
+    `force=True` downgrades the hard error to a warning; it exists for one-off scripts, never for a
+    production imputation run.
+    """
+    if not getattr(dataset, 'use_attr_degree', False):
+        return None
+
+    scope = getattr(dataset, 'degree_scope', DEGREE_SCOPE_TRAIN_ONLY)
+    if scope == DEGREE_SCOPE_TRAIN_ONLY:
+        message = (
+            "[Degree] degree_scope='train_only' is illegal at DEPLOYMENT time: the column is counted "
+            "from the 80% train pool, which does not exist here.\n"
+            "  set dataset.degree_scope: full            (use the whole observed graph - legal only\n"
+            "                                             because the candidate pair is unobserved,\n"
+            "                                             so its own edge cannot boost its feature), or\n"
+            "        dataset.degree_scope: calibrated_full + degree_calibration_path: <reference.npz>\n"
+            "                                            (full count mapped onto the training-time\n"
+            "                                             scale; recommended when the checkpoint was\n"
+            "                                             trained with degree_scope: train_only)."
+        )
+        if not force:
+            raise ValueError(message)
+        print("WARNING: " + message)
+        return None
+
+    values = dataset.ensure_degree_values()
+    if scope == DEGREE_SCOPE_FULL and not getattr(dataset, 'degree_calibration_path', None):
+        print("[Degree] WARNING: degree_scope='full' without degree_calibration_path. If the "
+              "checkpoint was trained with degree_scope='train_only', its column was a ~0.8 thinning "
+              "of what is fed here (relative sd ~ 0.5/sqrt(degree)), so the feature is off-scale.\n"
+              "        Use degree_scope: calibrated_full + the reference npz written by the training "
+              "run, or retrain with dataset.degree_thinning < 1.0 so the model sees several "
+              "completeness levels.")
+    return values
+
+
 def load_predefined_negatives(neg_dir, company_ids):
     """Load the predefined negatives (CSV) and keep only triples whose endpoints exist in the graph.
 
@@ -84,7 +260,10 @@ class CompanySupplyDataset(Dataset):
                  min_degree=2, source_filter='semi', other_possible_fill=0.0,
                  filter_factset_neg=False, intra_industry_neg=True, use_pred_neg=True,
                  use_attr_onehot=False, onehot_attrs=None,
-                 use_attr_degree=False, degree_property='degree'):
+                 use_attr_degree=False, degree_property='degree',
+                 degree_scope=DEGREE_SCOPE_TRAIN_ONLY, degree_triples=None,
+                 degree_triples_path=None, degree_thinning=1.0, degree_thinning_seed=None,
+                 degree_calibration_path=None, degree_calibration_out=None):
         """
         Args:
             min_degree: both endpoint nodes of an edge must have degree >= min_degree (0=no filter)
@@ -108,14 +287,28 @@ class CompanySupplyDataset(Dataset):
                 block width equals the number of distinct non-empty values.
             use_attr_degree: if True, append ONE column log(1 + degree) to X, so that
                 X = [embedding | one-hot(...) | log1p(degree)]. ``degree`` is the number of incident
-                (source, target, year) triples in 2013-2025 counted on both endpoints (the same
-                quantity ``min_degree`` thresholds on, restricted by ``source_filter``). It is read
-                from the Neo4j property ``degree_property``; when that property is missing (or only
-                partially filled) it is computed once and written back to Neo4j first.
-                NOTE: the statistic is transductive - it sees every positive of the window, including
-                the val/test edges - so it must not be enabled for runs that are compared with the
-                no-degree baseline on val/test metrics.
-            degree_property: name of the Neo4j node property that stores (or will store) the degree.
+                (source, target, year) triples counted on both endpoints - the same quantity
+                ``min_degree`` thresholds on, restricted by ``source_filter``. The column is computed
+                ON THE FLY for every run (never read from or written to Neo4j any more) and one
+                scope has to be declared through ``degree_scope``. See TechnicalGuide.md section 3.5:
+                the column is the quantity ``min_degree`` filters on, so a whole-window count encodes
+                the positive-inclusion rule itself and must never be used to score val/test.
+            degree_scope: which edges the count sees - ``train_only`` (default; only the triples set
+                through ``set_degree_triples``, e.g. the 80% train pool) / ``full`` (every positive
+                of the window; DEPLOYMENT only) / ``calibrated_full`` (full count, quantile-mapped
+                onto the training-time reference read from ``degree_calibration_path``).
+            degree_triples: triples (source_id, target_id, year) used when the scope is train_only.
+            degree_triples_path: CSV alternative to ``degree_triples`` (Neo4j ids, columns
+                source,target,year). Used by entry points that rebuild a single split and therefore
+                have no split procedure to recompute the train pool from.
+            degree_thinning: keep-probability applied to the counted triples (<=1). 1.0 = no extra
+                thinning (a train-pool column is already a ~0.8 thinning of the observed window).
+            degree_thinning_seed: seed of the thinning draw; ``None`` -> derived from ``sample_seed``.
+            degree_calibration_path: reference column (npz) read by ``calibrated_full``.
+            degree_calibration_out: if set, the column computed under ``train_only`` is additionally
+                written there as a reference for later deployment runs.
+            degree_property: DEPRECATED / no longer read. Degree column used to be persisted as this
+                Neo4j node property; kept only so existing configs still validate.
         """
         self.embedding_name = embedding_name
         self.negative_ratio = negative_ratio
@@ -137,20 +330,38 @@ class CompanySupplyDataset(Dataset):
                 "onehot_attrs: ['country', 'industry_2nd', 'category_3rd']"
             )
         self.use_attr_degree = bool(use_attr_degree)
+        # Kept for backwards compatibility only: the column is no longer stored in Neo4j.
         self.degree_property = validate_property_name(degree_property or 'degree')
+        if degree_scope not in _DEGREE_SCOPES:
+            raise ValueError(
+                f"degree_scope must be one of {_DEGREE_SCOPES}, got {degree_scope!r}"
+            )
+        self.degree_scope = degree_scope
+        self.degree_triples = list(degree_triples) if degree_triples is not None else None
+        self.degree_triples_path = degree_triples_path
+        if degree_thinning is not None and not (0.0 < float(degree_thinning) <= 1.0):
+            raise ValueError(
+                f"degree_thinning must lie in (0, 1], got {degree_thinning!r}"
+            )
+        self.degree_thinning = 1.0 if degree_thinning is None else float(degree_thinning)
+        self.degree_thinning_seed = degree_thinning_seed
+        self.degree_calibration_path = degree_calibration_path
+        self.degree_calibration_out = degree_calibration_out
         # Filled in by _cache_company_info (None when the one-hot option is disabled)
         self.attr_onehot_matrix = None
         self.attr_onehot_row = {}
         self.attr_onehot_vocabs = {}
         self.attr_onehot_sizes = {}
         self.attr_onehot_dim = 0
-        # Degree channel: float vector indexed by PyG node index (None when disabled)
+        # Degree channel: float vector indexed by PyG node index (None = not computed yet)
         self.degree_values = None
         
         if isinstance(sample_seed, int):
             self.random=random.Random(sample_seed)
+            self._sample_seed = sample_seed
         else:
             self.random=random.Random(42)
+            self._sample_seed = 42
         
         self._cache_company_info()
 
@@ -231,8 +442,8 @@ class CompanySupplyDataset(Dataset):
         if self.use_attr_onehot:
             self._build_attr_onehot(result)
 
-        if self.use_attr_degree:
-            self.degree_values = self._ensure_degree_property()
+        # The degree column needs the split's train triples, which are known only after
+        # create_bootstrap_datasets ran, so it is assembled lazily (see ensure_degree_values()).
 
         # All years (restricted to the 2013-2025 study window)
         result = self.neo4j_host.execute_query("""
@@ -311,65 +522,99 @@ class CompanySupplyDataset(Dataset):
             RETURN id(c1) as source_id, id(c2) as target_id
         """
 
-    def _ensure_degree_property(self) -> np.ndarray:
-        """Return the degree of every node as a vector indexed by PyG node index.
+    def set_degree_triples(self, triples):
+        """Declare the triples the train-only count may use (usually the 80% train pool).
 
-        The degree is persisted on the Neo4j node as ``self.degree_property`` so that the value is
-        computed once and then shared by every run / every entry point (training, bootstrap,
-        imputation). When the property is missing or only partially present it is computed here and
-        written back in batches; the write is idempotent, so a re-run just reads the property.
-
-        Definition: number of incident (source, target, year) triples in the study window, counted
-        on BOTH endpoints - the exact quantity ``min_degree`` thresholds on. Nodes without any edge
-        get 0 (explicitly written, so the "is the property there?" check does not re-trigger).
+        Called once per run before X is assembled; everything after that - train, val, test and the
+        bootstrap iterations - reuses the resulting column through `_share_metadata`.
         """
-        prop = self.degree_property
+        self.degree_triples = list(triples) if triples is not None else None
+        self.degree_values = None  # invalidate: the count changed
+        return self.degree_triples
+
+    def _degree_thinning_seed(self):
+        if self.degree_thinning_seed is not None:
+            return int(self.degree_thinning_seed)
+        return int(getattr(self, '_sample_seed', 42))
+
+    def _resolve_degree_triples(self):
+        triples = self.degree_triples
+        if triples is None and self.degree_triples_path:
+            triples = load_degree_triples_csv(self.degree_triples_path)
+            print(f"[Degree] loaded {len(triples)} train triples from {self.degree_triples_path}")
+        if triples is None:
+            raise ValueError(
+                "[Degree] degree_scope='train_only' but no training triples are available.\n"
+                "  In the study pipeline they are set automatically by create_bootstrap_datasets();\n"
+                "  for a stand-alone entry point pass degree_triples=... or degree_triples_path=<csv>.\n"
+                "  If this is a deployment run (imputation / threshold fitting on the observed graph),\n"
+                "  set dataset.degree_scope: full (or calibrated_full) instead - there is no held-out\n"
+                "  set at deployment time, so the full observed graph is the right count."
+            )
+        if self.degree_thinning < 1.0:
+            triples = thin_triples(triples, self.degree_thinning, self._degree_thinning_seed())
+            print(f"[Degree] thinning keep_probability={self.degree_thinning} "
+                  f"seed={self._degree_thinning_seed()} -> {len(triples)} triples counted")
+        return triples
+
+    def _full_window_triples(self):
+        """Every positive of the study window (same population as `_degree_edge_query`)."""
         if not self.source_filter:
-            print("[Degree] WARNING: dataset.source_filter is unset -> the degree is computed over EVERY "
-                  "SupplyProductTo relationship in the database (i.e. also over imputed edges, 10^8 rows in "
-                  "the imputed graph). Set dataset.source_filter (e.g. 'semi') to stay on the training "
-                  "population, or pre-fill the property yourself.")
-        total = self.neo4j_host.execute_query(
-            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL RETURN count(c) AS n"
-        )[0]["n"]
-        present = self.neo4j_host.execute_query(
-            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL AND c.`{prop}` IS NOT NULL "
-            f"RETURN count(c) AS n"
-        )[0]["n"]
+            print("[Degree] WARNING: dataset.source_filter is unset -> the count runs over EVERY "
+                  "SupplyProductTo relationship in the database (including previously imputed edges, "
+                  "10^8 rows in the imputed graph). Set source_filter (e.g. 'semi').")
+        records = self.neo4j_host.execute_query(self._degree_edge_query())
+        return [(r["source_id"], r["target_id"], None) for r in
+                tqdm(records, desc="counting degree")]
 
-        if present < total:
-            print(f"[Degree] property '{prop}' found on {present}/{total} embedded nodes -> "
-                  f"computing it and writing it back to Neo4j")
-            degree = {}
-            for record in tqdm(self.neo4j_host.execute_query(self._degree_edge_query()),
-                               desc="computing degree"):
-                src, tgt = record["source_id"], record["target_id"]
-                degree[src] = degree.get(src, 0) + 1
-                degree[tgt] = degree.get(tgt, 0) + 1
+    def compute_degree_values(self) -> np.ndarray:
+        """Build the degree column for the declared scope (2026-09-17).
 
-            rows = [{'id': int(cid), 'deg': int(degree.get(cid, 0))} for cid in self.node_mapping]
-            batch_size = 5000
-            for start in range(0, len(rows), batch_size):
-                self.neo4j_host.execute_query(
-                    f"UNWIND $rows AS row MATCH (c:EntityObj) WHERE id(c) = row.id "
-                    f"SET c.`{prop}` = row.deg",
-                    parameters={'rows': rows[start:start + batch_size]},
-                )
-            written = sum(1 for r in rows if r['deg'] > 0)
-            print(f"[Degree] wrote '{prop}' for {len(rows)} nodes ({written} with at least one edge, "
-                  f"max degree {max((r['deg'] for r in rows), default=0)})")
+        Nothing is written to Neo4j: the column is a RUN-TIME DERIVED FEATURE. That removes both the
+        leakage (a persisted whole-window count whose provenance nobody could verify) and the
+        cross-run contamination it caused. See the DEGREE_SCOPE_* block above for what each scope
+        means and when it may be used.
+        """
+        if self.degree_scope == DEGREE_SCOPE_TRAIN_ONLY:
+            values = count_degree_from_triples(self._resolve_degree_triples(), self.node_mapping)
         else:
-            print(f"[Degree] property '{prop}' already present on all {total} embedded nodes -> reusing it")
+            values = count_degree_from_triples(self._full_window_triples(), self.node_mapping)
+            if self.degree_scope == DEGREE_SCOPE_CALIBRATED_FULL:
+                if not self.degree_calibration_path:
+                    raise ValueError(
+                        "[Degree] degree_scope='calibrated_full' requires "
+                        "dataset.degree_calibration_path (a reference npz written by "
+                        "save_degree_reference() during training)."
+                    )
+                reference = load_degree_reference(self.degree_calibration_path)
+                before = (float(values.mean()), float(values.max()))
+                values = map_to_reference(values, reference)
+                print(f"[Degree] calibrated to the training-time reference "
+                      f"({self.degree_calibration_path}): mean {before[0]:.2f}->"
+                      f"{float(values.mean()):.2f}, max {before[1]:.0f}->"
+                      f"{float(values.max()):.0f}")
 
-        records = self.neo4j_host.execute_query(
-            f"MATCH (c:EntityObj) WHERE c.{self.embedding_name} IS NOT NULL "
-            f"RETURN id(c) AS company_id, coalesce(c.`{prop}`, 0) AS deg"
-        )
-        by_id = {record["company_id"]: float(record["deg"]) for record in records}
-        values = np.zeros(len(self.node_mapping), dtype=np.float32)
-        for company_id, idx in self.node_mapping.items():
-            values[idx] = by_id.get(company_id, 0.0)
+        if self.degree_scope == DEGREE_SCOPE_TRAIN_ONLY and self.degree_calibration_out:
+            if os.path.exists(self.degree_calibration_out):
+                print(f"[Degree] reference file already exists -> left untouched: "
+                      f"{self.degree_calibration_out}")
+            else:
+                save_degree_reference(self.degree_calibration_out, values)
+
+        print(f"[Degree] scope='{self.degree_scope}': n={values.size}, max={int(values.max())} "
+              f"mean={float(values.mean()):.2f}, zero-degree nodes={int((values == 0).sum())}")
+        self.degree_values = values
         return values
+
+    def ensure_degree_values(self) -> np.ndarray:
+        """Idempotent accessor used by `assemble_node_features` (the single X assembly point)."""
+        if self.degree_values is None:
+            if not self.use_attr_degree:
+                raise RuntimeError(
+                    "[Degree] ensure_degree_values() called while use_attr_degree is False"
+                )
+            return self.compute_degree_values()
+        return self.degree_values
 
     def describe_node_features(self, feature_dim: int = None) -> str:
         """Human-readable description of how X is assembled (printed once per graph build)."""
@@ -381,7 +626,7 @@ class CompanySupplyDataset(Dataset):
             extras.append(f"one-hot[{blocks}] (missing attribute -> all-zero row)")
             total += self.attr_onehot_dim
         if self.degree_values is not None:
-            extras.append("log1p(degree)")
+            extras.append(f"log1p(degree[{self.degree_scope}])")
             total += 1
 
         if not extras:
@@ -708,6 +953,10 @@ def assemble_node_features(full_set: CompanySupplyDataset) -> torch.Tensor:
         features = np.concatenate([features, extra], axis=1)
 
     degree_values = getattr(full_set, 'degree_values', None)
+    if degree_values is None and getattr(full_set, 'use_attr_degree', False):
+        # Played lazily on purpose: the train-only count needs the split's triples, which do not
+        # exist yet while CompanySupplyDataset is being constructed.
+        degree_values = full_set.ensure_degree_values()
     if degree_values is not None:
         degree_values = np.asarray(degree_values, dtype=np.float32).reshape(-1)
         if degree_values.shape[0] != features.shape[0]:

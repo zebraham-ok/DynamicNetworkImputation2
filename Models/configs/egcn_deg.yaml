@@ -1,0 +1,63 @@
+# ============================================================
+# EvolveGCN + degree channel
+# 与基线 egcn.yaml 的唯一差别：dataset.use_attr_degree = true -> X 末尾多一列 log(1+degree)
+# Deep-merged on top of Training/common_config.yaml (Training/config_loader.load_config)
+# ============================================================
+# 定位："标签可分离性探针"（是 model-agnostic 的消融，不是"更好的模型"）。2026-09-17 起度列改为
+# 运行期派生，train_only 口径下它不再等价于 min_degree 那条入样规则，因此
+#   * 不能与未开度通道的 baseline（含 egcn.yaml）在 val/test 上并列比较；
+#   * 结果不进论文结果表；
+#   * 旧的 *_deg 数字来自全窗口计数（泄漏实测 AUC 0.984 / 0.936），结论一律作废待重述。
+# 详见 Training/common_config.yaml 的 use_attr_degree 注释块与 TechnicalGuide.md §3.5。
+#
+# 为什么这里不需要改 model.kwargs：共享特征抽取器 NodeFeatureExtractor 的 input_dim 取自
+# dynamic_data.x.size(1)（run_sampling.py / train_*.py 的 auto_context），X 从 701 变 702 会自动
+# 反映到第一层 Linear；hidden_dims 的 "auto" 同理。故任何 backbone 都不用配宽度。
+#
+# 为什么必须重训到底：X 宽了一列 ⇒ d=701 的 ckpt / backbone.pth 全部无法载入（严格来说
+# load_state_dict(strict=False) 会在形状不匹配处直接报 RuntimeError），所以
+#   * pretrained.path 保持 null，输出必须落到新目录 output_subdir: egcn_deg；
+#   * 走 run_sampling.py 时 Phase 1 的 donor backbone 也是 702 宽的，整个 run 都在新目录里，
+#     不要 resume 旧的 sampling_*/seed*/backbone.pth。
+#
+# 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
+#   单次：      python Training/train_egcn.py -c egcn_deg -d cuda:0
+#   四模式/多种子：python SampleSetting/run_sampling.py -c egcn_deg -s egcn_deg -d cuda:0 --repeats 4
+# ============================================================
+
+name: EvolveGCN-Deg
+output_subdir: egcn_deg
+static_graph: true
+
+dataset:
+  module: Data.company_dataset
+  dataloader_type: pyg
+  batch_size: 128
+  use_attr_degree: true          # <- 唯一的实验变量，关掉它这份 config 就是 egcn.yaml
+  degree_scope: train_only       # 评测期唯一合法口径（full 会把留出边塞回特征）
+  degree_thinning: 1.0           # 1.0=照原样计数；训练/部署尺度要想对齐才调到 ~0.8（见 §3.5）
+  degree_thinning_seed: null     # null -> 由数据集采样种子派生（可复现）
+  degree_calibration_out: null   # 见下方说明；留 null 则以后部署只能用 degree_scope: full
+  degree_property: degree        # DEPRECATED：2026-09-17 起既不读也不写，仅为旧配置可解析而保留
+
+model:
+  module: Models.egcn
+  class: EGCN_PyG_Vectorized
+  kwargs:
+    hidden_dims: ["auto", 128, 64]
+    activation: "torch.nn.ReLU()"
+    num_gru_layers: 2
+    dropout: 0.3
+    time_steps: auto
+    device: auto
+    # Shared node-feature extractor (use_fc_embedding / fc_embed_dim / fc_hidden_dim /
+    # fc_num_layers) is inherited from Training/common_config.yaml (model.kwargs).
+
+trainer:
+  type: standard
+  module: Training.trainer_common
+  class: DynamicGraphTrainer
+
+analysis:
+  predict_interface: node_time
+  checkpoint_metrics: [test_f1, test_auc, factset_quantile]

@@ -37,6 +37,9 @@ from torch_geometric.data import Data
 from Data.graph_dataset import (
     CompanySupplyDataset, build_static_graph, assemble_node_features,
     _DEFAULT_NEG_DIR, load_predefined_negatives,
+    DEGREE_SCOPE_TRAIN_ONLY, DEGREE_SCOPE_FULL, DEGREE_SCOPE_CALIBRATED_FULL,
+    save_degree_reference, load_degree_reference, map_to_reference,
+    ensure_degree_ready_for_deployment,
 )
 
 
@@ -54,6 +57,14 @@ def dataset_feature_kwargs(ds_cfg: dict) -> dict:
         # (dataset.use_attr_degree) - it changes the width of X, hence every checkpoint.
         'use_attr_degree': ds_cfg.get('use_attr_degree', False),
         'degree_property': ds_cfg.get('degree_property', 'degree'),
+        # Which edges the count may see (2026-09-17): 'train_only' while evaluating a model,
+        # 'full' / 'calibrated_full' only when deploying it. See TechnicalGuide.md 3.5.
+        'degree_scope': ds_cfg.get('degree_scope', DEGREE_SCOPE_TRAIN_ONLY),
+        'degree_triples_path': ds_cfg.get('degree_triples_path', None),
+        'degree_thinning': ds_cfg.get('degree_thinning', 1.0),
+        'degree_thinning_seed': ds_cfg.get('degree_thinning_seed', None),
+        'degree_calibration_path': ds_cfg.get('degree_calibration_path', None),
+        'degree_calibration_out': ds_cfg.get('degree_calibration_out', None),
     }
 
 
@@ -75,6 +86,10 @@ def create_bootstrap_datasets(
     onehot_attrs: list = None,
     use_attr_degree: bool = False,
     degree_property: str = 'degree',
+    degree_scope: str = DEGREE_SCOPE_TRAIN_ONLY,
+    degree_triples=None, degree_triples_path: str = None,
+    degree_thinning: float = 1.0, degree_thinning_seed: int = None,
+    degree_calibration_path: str = None, degree_calibration_out: str = None,
 ):
     """Create the three-way bootstrap data split (full / test / val / train_pool).
 
@@ -82,9 +97,19 @@ def create_bootstrap_datasets(
     with `neg_dir`): when True they are loaded up front and split 8:1:1 together with the negatives,
     when False the file is not read at all. It has nothing to do with the val/test fixed negatives,
     which are always used.
+
+    The `degree_*` options decide which edges the optional degree column may count (2026-09-17); see
+    TechnicalGuide.md 3.5. `degree_triples` is normally left None here - the split is recomputed a
+    few lines below and the TRAIN POOL is what gets counted.
     """
     feature_kwargs = {'use_attr_onehot': use_attr_onehot, 'onehot_attrs': onehot_attrs,
-                      'use_attr_degree': use_attr_degree, 'degree_property': degree_property}
+                      'use_attr_degree': use_attr_degree, 'degree_property': degree_property,
+                      'degree_scope': degree_scope, 'degree_triples': degree_triples,
+                      'degree_triples_path': degree_triples_path,
+                      'degree_thinning': degree_thinning,
+                      'degree_thinning_seed': degree_thinning_seed,
+                      'degree_calibration_path': degree_calibration_path,
+                      'degree_calibration_out': degree_calibration_out}
 
     full_dataset = CompanySupplyDataset(
         negative_ratio=0,
@@ -120,6 +145,15 @@ def create_bootstrap_datasets(
     print(f"[Bootstrap Data] Test:  {len(test_pos)} ({len(test_pos)/len(all_pos)*100:.1f}%)")
     print(f"[Bootstrap Data] Val:   {len(val_pos)} ({len(val_pos)/len(all_pos)*100:.1f}%)")
     print(f"[Bootstrap Data] Train Pool: {len(train_pool_pos)} ({len(train_pool_pos)/len(all_pos)*100:.1f}%)")
+
+    # Degree channel (2026-09-17): the column has to be counted from the TRAIN POOL, so it can only
+    # be built once the split exists. It is computed eagerly here, stored on full_dataset and shared
+    # with every split through _share_metadata, so train/val/test and the bootstrap iterations all
+    # read exactly one and the same column. Nothing is written back to Neo4j.
+    if getattr(full_dataset, 'use_attr_degree', False):
+        if full_dataset.degree_scope == DEGREE_SCOPE_TRAIN_ONLY:
+            full_dataset.set_degree_triples(train_pool_pos)
+        full_dataset.ensure_degree_values()
 
     # --- Predefined negatives from the CSV: injected before the split, distributed 8:1:1 ---
     csv_neg = _load_csv_negatives(
@@ -380,10 +414,44 @@ def _share_metadata(dataset, source):
     dataset.attr_onehot_sizes = getattr(source, 'attr_onehot_sizes', {})
     dataset.attr_onehot_dim = getattr(source, 'attr_onehot_dim', 0)
     # Degree channel: indexed by PyG node index, so it can be shared as-is (the splits share
-    # node_mapping). Only full_dataset queries Neo4j; every other split reuses these values.
+    # node_mapping). Only full_dataset computes it once - every other split reuses the column, which
+    # is exactly what guarantees that val/test cannot see a different (wider) count than training.
     dataset.use_attr_degree = getattr(source, 'use_attr_degree', False)
     dataset.degree_property = getattr(source, 'degree_property', 'degree')
+    dataset.degree_scope = getattr(source, 'degree_scope', DEGREE_SCOPE_TRAIN_ONLY)
+    dataset.degree_triples = getattr(source, 'degree_triples', None)
+    dataset.degree_triples_path = getattr(source, 'degree_triples_path', None)
+    dataset.degree_thinning = getattr(source, 'degree_thinning', 1.0)
+    dataset.degree_thinning_seed = getattr(source, 'degree_thinning_seed', None)
+    dataset.degree_calibration_path = getattr(source, 'degree_calibration_path', None)
+    dataset.degree_calibration_out = getattr(source, 'degree_calibration_out', None)
     dataset.degree_values = getattr(source, 'degree_values', None)
+
+
+def rebuild_degree_column(dataset, all_pos, data_cfg=None, seed=42):
+    """Rebuild the degree column for a dataset built OUTSIDE the three-way split procedure.
+
+    Entry points such as Prediction/find_threshold*.py reconstruct one split from disk; they have no
+    `train_pool` object, but the train-only count is deterministic given (all_pos, ratios, seed), so
+    the original column can be recomputed exactly instead of being persisted anywhere. `all_pos` must
+    be the deduplicated, sorted positive list built the same way as in `create_bootstrap_datasets`.
+    """
+    if not getattr(dataset, 'use_attr_degree', False):
+        return None
+    if dataset.degree_scope != DEGREE_SCOPE_TRAIN_ONLY:
+        return dataset.ensure_degree_values()
+    data_cfg = data_cfg or {}
+    train_pool_pos, _, _ = _split_8_1_1(
+        all_pos,
+        data_cfg.get('test_ratio', 0.10),
+        data_cfg.get('val_ratio', 0.10),
+        seed,
+        label='positives',
+    )
+    dataset.set_degree_triples(train_pool_pos)
+    print(f"[Degree] rebuilt the train-pool column outside the study pipeline "
+          f"({len(train_pool_pos)} of {len(all_pos)} positives, seed={seed})")
+    return dataset.ensure_degree_values()
 
 
 # Study-window year range (global constants)
@@ -685,7 +753,11 @@ def create_dataloaders(negative_ratio=1, embedding_name="embedding",
                        other_possible_fill=0.0, filter_factset_neg=False,
                        intra_industry_neg=True, use_pred_neg=True, neg_dir=None,
                        use_attr_onehot=False, onehot_attrs=None,
-                       use_attr_degree=False, degree_property='degree'):
+                       use_attr_degree=False, degree_property='degree',
+                       degree_scope=DEGREE_SCOPE_TRAIN_ONLY, degree_triples=None,
+                       degree_triples_path=None, degree_thinning=1.0,
+                       degree_thinning_seed=None, degree_calibration_path=None,
+                       degree_calibration_out=None):
     """Create train/val/test data loaders, returning (static_data, train_loader, val_loader, test_loader, full_dataset)."""
     bootstrap_data = create_bootstrap_datasets(
         negative_ratio=negative_ratio,
@@ -705,6 +777,13 @@ def create_dataloaders(negative_ratio=1, embedding_name="embedding",
         onehot_attrs=onehot_attrs,
         use_attr_degree=use_attr_degree,
         degree_property=degree_property,
+        degree_scope=degree_scope,
+        degree_triples=degree_triples,
+        degree_triples_path=degree_triples_path,
+        degree_thinning=degree_thinning,
+        degree_thinning_seed=degree_thinning_seed,
+        degree_calibration_path=degree_calibration_path,
+        degree_calibration_out=degree_calibration_out,
     )
 
     # Standard training: use all of train_pool, no bootstrap resampling

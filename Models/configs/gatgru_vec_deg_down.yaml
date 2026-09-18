@@ -28,7 +28,8 @@ dataset:
   dataloader_type: pyg
   batch_size: 128
   use_attr_degree: true
-  degree_property: degree
+  degree_scope: train_only       # 评测期唯一合法的口径（见 §3.5）
+  degree_property: degree        # DEPRECATED：2026-09-17 起既不读也不写
 
 model:
   module: Models.gatgru_vectorized

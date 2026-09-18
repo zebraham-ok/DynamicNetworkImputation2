@@ -15,9 +15,13 @@
 # 单层，所以用 2 层再跑一遍实验 A，可以顺带看"度信息"在强 backbone 上是否还有增益。
 #
 # 注意事项（TechnicalGuide.md §3.5，逐条同样适用于这份 config）：
-#   * degree = 2013-2025 窗口 (source,target,year) 三元组两端计数，受 source_filter 约束，
-#     与 min_degree 同尺度；首次运行由数据集算好写回 Neo4j 属性 `degree_property`。
-#   * 传导式特征（含 val/test 边）⇒ 不能与未开度通道的 baseline 在 val/test 上并列比较。
+#   * degree = (source,target,year) 三元组两端计数，受 source_filter 约束，与 min_degree 同尺度；
+#     2026-09-17 起是**运行期派生特征**，每次运行现算，**不再读写** Neo4j 属性
+#     `degree_property`（该键仅保留兼容）。
+#   * degree_scope = train_only ⇒ 只数那 80% 训练池且三个 split 共用同一列 ⇒ **不再**等价于
+#     min_degree 那条入样规则，文件头那组泄漏数字（AUC 0.984 / 0.936）是旧口径的，探针结论
+#     必须重新表述；残留泄漏只有"自计数"。
+#   * 不能与未开度通道的 baseline 在 val/test 上并列比较，也不进论文结果表。
 #   * X 宽了一列 ⇒ 旧 ckpt / backbone.pth 全部失效，必须重训（含 Phase 1）。
 #
 # 运行（换 config 必须显式 -s，见 TechnicalGuide §8）：
@@ -33,7 +37,8 @@ dataset:
   dataloader_type: pyg
   batch_size: 128
   use_attr_degree: true
-  degree_property: degree
+  degree_scope: train_only       # 评测期唯一合法的口径（见文件头 / §3.5）
+  degree_property: degree        # DEPRECATED：2026-09-17 起既不读也不写
 
 model:
   module: Models.gatgru_vectorized
